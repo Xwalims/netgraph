@@ -240,13 +240,15 @@ func (r *Resolver) queryOverTCP(
 	name string,
 	recordType RecordType,
 ) (*Result, error) {
-	// A TCP query is length-prefixed by queryServer itself, so an already
-	// framed query has to be handed back in its bare form.
-	unframed := query
-	if len(query) >= 2 && int(binary.BigEndian.Uint16(query[0:2])) == len(query)-2 {
-		unframed = query[2:]
-	}
-	return r.queryServer(ctx, server, unframed, name, recordType, true, true)
+	// query arrives bare. This is only ever called from the UDP branch, where
+	// the message was not length-prefixed, and queryServer prefixes a TCP
+	// message itself.
+	//
+	// It is tempting to "helpfully" strip a prefix if the first two bytes
+	// happen to equal the remaining length, but the first two bytes of a DNS
+	// query are the transaction ID, so that test is true by coincidence about
+	// once in 65536 queries and would silently corrupt the query.
+	return r.queryServer(ctx, server, query, name, recordType, true, true)
 }
 
 // normaliseServer turns "1.1.1.1" or "dns.google" into "1.1.1.1:53".
