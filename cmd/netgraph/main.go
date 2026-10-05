@@ -143,6 +143,8 @@ func run(args []string) int {
 		return tool.cmdExport(args[1:])
 	case "cache":
 		return tool.cmdCache(args[1:])
+	case "watch":
+		return tool.cmdWatch(ctx, args[1:])
 	}
 
 	fmt.Fprintf(os.Stderr, "netgraph: unknown command %q\n\n", args[0])

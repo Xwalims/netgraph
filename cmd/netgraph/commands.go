@@ -32,6 +32,7 @@ import (
 	"github.com/Xwalims/netgraph/internal/latency"
 	"github.com/Xwalims/netgraph/internal/render"
 	"github.com/Xwalims/netgraph/internal/traceroute"
+	"github.com/Xwalims/netgraph/internal/watch"
 	"github.com/Xwalims/netgraph/pkg/models"
 )
 
@@ -904,6 +905,95 @@ func (a *app) cmdCache(args []string) int {
 
 	fmt.Fprintf(os.Stderr, "netgraph cache: unknown command %q; use stats, clear or sweep\n", command)
 	return exitUnimplemented
+}
+
+// cmdWatch monitors a target and prints events as they happen.
+//
+// It is not in main.go's dispatcher list yet; this wires it up.
+func (a *app) cmdWatch(ctx context.Context, args []string) int {
+	parsed, positional, err := parseSharedFlags(args,
+		[]string{"interval", "count", "type", "server", "timeout", "max-hops", "probes", "interface"},
+		[]string{"trace", "json", "no-color", "quiet"})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "netgraph watch: %v\n", err)
+		return exitUnimplemented
+	}
+	if len(positional) != 1 {
+		fmt.Fprintf(os.Stderr, "netgraph watch: expected one target, got %d\n", len(positional))
+		return exitUnimplemented
+	}
+
+	interval, err := parsed.duration("interval", 30*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "netgraph watch: %v\n", err)
+		return exitUnimplemented
+	}
+	count, err := parsed.intVal("count", 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "netgraph watch: %v\n", err)
+		return exitUnimplemented
+	}
+	if interval < time.Second {
+		fmt.Fprintf(os.Stderr, "netgraph watch: --interval %s is below a second, which is "+
+			"more traffic than a route check is worth\n", interval)
+		return exitUnimplemented
+	}
+
+	options := watch.Options{
+		Interval: interval,
+		Count:    count,
+		Trace:    parsed.bool("trace"),
+		Server:   parsed.str("server", ""),
+	}
+	if types := parsed.str("type", ""); types != "" {
+		options.DNSRecords = []string{types}
+	}
+	if options.Trace {
+		traceOptions := traceroute.Options{MaxHops: 12, Probes: 1, Timeout: 2 * time.Second}
+		if capability := traceroute.Detect(); !capability.RawAvailable {
+			fmt.Fprintf(os.Stderr, "netgraph watch: --trace needs a raw ICMP socket (%s)\n", capability.Reason)
+			fmt.Fprintf(os.Stderr, "  fix: %s\n", capability.Fix)
+			return exitUnimplemented
+		}
+		options.TraceOptions = traceOptions
+	}
+
+	monitor := watch.New(positional[0], options)
+
+	if !parsed.bool("json") && !parsed.bool("quiet") {
+		fmt.Printf("\n  %s %s  every %s\n", heading("watching", a.colour), positional[0], interval)
+		if count == 0 {
+			fmt.Printf("  the first check sets a baseline; only changes after it are reported\n")
+		}
+		fmt.Printf("  Ctrl-C to stop\n\n")
+	}
+
+	// The baseline is stated plainly: an output whose first line is "reachable"
+	// reads as a finding when it is only an observation.
+	events := 0
+	err = monitor.Run(ctx, func(event models.WatchEvent) {
+		events++
+		if parsed.bool("json") {
+			if code := printJSON(event); code != exitOK {
+				return
+			}
+			return
+		}
+		fmt.Printf("  %s  %-16s %s\n",
+			event.At.Format("15:04:05"),
+			event.Kind,
+			event.Detail)
+		if event.Previous != "" && event.Current != "" && event.Previous != event.Current {
+			fmt.Printf("      %s -> %s\n", event.Previous, event.Current)
+		}
+	})
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "netgraph watch: %v\n", err)
+		return exitQueryFailed
+	}
+	fmt.Fprintf(os.Stderr, "netgraph watch: stopped after reporting %d events\n", events)
+	return exitOK
 }
 
 func orNone(value string) string {

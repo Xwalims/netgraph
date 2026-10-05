@@ -8,43 +8,47 @@
 
 > **See how the internet reaches your destination.**
 
-A network diagnostic CLI that combines traceroute, DNS analysis, ASN lookup and
-latency measurement, with route visualisation. This is the v0.1.0 core: the DNS
-analyzer is complete and runs against real servers; the traceroute engine is not
-written yet.
+A network diagnostic CLI combining traceroute, DNS analysis, ASN lookup, latency
+monitoring and route visualisation. Linux, macOS and Windows.
 
 ---
 
 ## Status
 
-Read this before the rest, because it decides what the tool can do today.
+`trace` and `map` need a raw socket, which not every host grants. Everything else
+runs unprivileged.
 
 | Command | State |
 | --- | --- |
-| `netgraph dns` | **working** — full implementation, all record types, real queries |
-| `netgraph version`, `help` | working |
-| `netgraph ip` | not implemented |
-| `netgraph trace` | not implemented |
-| `netgraph ping` | not implemented |
-| `netgraph asn` | not implemented |
-| `netgraph compare` | not implemented |
-| `netgraph map` | not implemented |
-| `netgraph watch` | not implemented |
-| `netgraph export` | not implemented |
+| `netgraph dns` | **working** — own DNS codec, all ten record types, real queries |
+| `netgraph ip` | working — classification, ASN, reverse DNS |
+| `netgraph asn` | working — RIPEstat and RDAP, merged, cached |
+| `netgraph ping` | working — TCP RTT, jitter, loss, percentiles |
+| `netgraph watch` | working — reachability, latency, route and DNS changes |
+| `netgraph compare` | working — traces several targets and diffs them |
+| `netgraph map` | working — ASCII, JSON, HTML and CSV output |
+| `netgraph export` | working — re-renders a saved result |
+| `netgraph cache` | working — stats, clear, sweep |
+| `netgraph trace` | working, **requires `CAP_NET_RAW`** |
+| `netgraph map` | working, **requires `CAP_NET_RAW`** |
 
-Every unimplemented command says so and exits `2`. None of them prints nothing and
-exits `0`, because a caller cannot tell that from success:
+Traceroute without that capability does not pretend:
 
 ```console
 $ netgraph trace google.com
-netgraph 0.1.0: "trace" is not implemented in 0.1.0 yet.
-Working commands: dns, version, help
+netgraph: traceroute needs a raw ICMP socket, which this host does not allow.
+  reason:  listen ip4:icmp 0.0.0.0: socket: operation not permitted
+  fix:     sudo setcap cap_net_raw+ep <path to netgraph>
+  note:    no protocol avoids this; --protocol only changes what is sent
+  without it, use: netgraph dns, netgraph ip, netgraph asn, netgraph ping
+
+  no route was measured
 $ echo $?
 2
 ```
 
-The data model for hops, routes, ASN records, latency statistics and watch events
-already exists in `pkg/models`, so the remaining work is the code that fills it.
+That message is the point. The alternative — an empty diagram and an exit code of
+zero — is indistinguishable from a network problem, and gets diagnosed as one.
 
 ---
 
@@ -56,13 +60,24 @@ $ cd netgraph
 $ go build -o netgraph ./cmd/netgraph
 ```
 
-Requires Go 1.23 or newer. No third-party dependencies at runtime.
+Requires Go 1.23 or newer. **No third-party dependencies.**
+
+```console
+$ sudo setcap cap_net_raw+ep ./netgraph   # only if you want traceroute
+```
 
 ---
 
 ## Usage
 
 ```console
+$ netgraph trace example.com                  trace the route
+$ netgraph trace example.com --protocol tcp --max-hops 30 --probes 5 --timeout 3s
+$ netgraph trace example.com --ipv6 --interface 192.168.1.10
+
+$ netgraph map example.com --format html --out route.html
+$ netgraph map example.com --format csv  --out route.csv
+
 $ netgraph dns example.com                    resolve with the system resolver
 $ netgraph dns example.com --server 1.1.1.1   query a specific nameserver
 $ netgraph dns example.com --type MX          one record type
@@ -70,7 +85,21 @@ $ netgraph dns example.com --all              every record type a name can have
 $ netgraph dns example.com --compare          several servers, and where they disagree
 $ netgraph dns 1.1.1.1 --reverse              PTR lookup
 $ netgraph dns example.com --json             machine-readable
+
+$ netgraph ip 1.1.1.1                         classify an address
+$ netgraph asn 8.8.8.8                        look up the autonomous system
+$ netgraph asn 8.8.8.8 --no-cache             refetch instead of using the cache
+
+$ netgraph ping example.com --count 100 --interval 500ms
+$ netgraph ping example.com --continuous
+
+$ netgraph compare example.com example.org
+$ netgraph export --in route.json --format html --out route.html
+$ netgraph watch example.com --interval 30s --type A
+$ netgraph cache stats
 ```
+
+Global flags: `--json`, `--no-color` (honours `NO_COLOR`), `--quiet`.
 
 Options:
 
@@ -273,37 +302,149 @@ printed, and carried in `--json`.
 
 ---
 
+### `netgraph ip 1.1.1.1`
+
+```console
+$ netgraph ip 1.1.1.1
+
+  IP address  1.1.1.1
+
+  family         IPv4
+  class          public
+  reverse dns    one.one.one.one
+  asn            AS13335
+  organisation   CLOUDFLARENET - Cloudflare, Inc.
+  prefix         1.1.1.0/24
+  announced      true
+  registry       rdap
+  rir            ARIN
+  abuse          helpdesk@apnic.net
+  sources        ripestat, rdap
+
+  country is where the network is registered, not where the
+  address or its users are. No city is shown: a GeoIP estimate
+  presented as a location would be a claim, not a measurement.
+```
+
+No city. GeoIP city data is frequently off by hundreds of kilometres, and printing
+it next to an exact IP address invites the reader to believe it.
+
+### `netgraph ping 1.1.1.1`
+
+```console
+$ netgraph ping 1.1.1.1 --count 4 --interval 300ms
+
+  latency 1.1.1.1  tcp/443
+  4 probes, interval 300ms, timeout 2s
+
+  10:48:23.584  18.3ms     good
+  10:48:23.803  22.4ms     fair
+  10:48:24.056  19.1ms     good
+  10:48:24.311  20.2ms     good
+
+  sent       0 of 4 lost (0%)
+  rtt        min 18.3ms   avg 19.9ms   max 22.4ms
+  jitter     2.4ms   stddev 1.5ms
+  percentiles p50 20.2ms   p90 22.4ms   p95 22.4ms   p99 22.4ms
+  ▇▅▆▅   18.3ms .. 22.4ms
+  this is end-to-end RTT measured over TCP. A router's own RTT is a
+  different quantity and is not mixed into it.
+```
+
+Measured over a TCP handshake rather than ICMP, because ICMP needs privileges and
+routers deprioritise it: an ICMP RTT is a lower bound on the path, not a
+measurement of it. The method is named in the header so the number is never
+mistaken for the other quantity.
+
+---
+
+## The traceroute engine
+
+Probes carry an increasing TTL; each router that decrements it to zero returns an
+ICMP Time Exceeded. Reading those replies is what reveals the path, which is why a
+raw socket is unavoidable — they arrive addressed to the sending host, not
+delivered to any socket the kernel would hand to an application.
+
+**Matching a reply to a probe.** The ICMP error quotes the IP header and the first
+8 bytes of the datagram that provoked it. For a UDP probe those are the entire UDP
+header, so the quote carries the probe's destination port and nothing else of
+ours. Each probe therefore gets a distinct port — that is what makes the reply
+attributable — and a table maps that port to the send time, from which the round
+trip is computed.
+
+**A port collision test.** Two probes in flight sharing a port could not be told
+apart, and one hop's timing could be attributed to another. There is a test that
+enumerates every port across the default range and fails on a repeat.
+
+**Capability is checked before probing.** All three protocols need the socket,
+not just ICMP: UDP and TCP are identified by the replies they provoke. So the
+check is about the host, not about `--protocol`.
+
+**An empty route draws nothing.** The first version drew `LOCAL -> DESTINATION`
+with `0% loss`, asserting both that a path existed and that nothing was lost when
+nothing had been measured.
+
+---
+
+## ASN intelligence
+
+RIPEstat answers "is this prefix live"; RDAP answers "who is registered to it".
+Neither is complete alone, so both are queried and merged, with the source of each
+field recorded.
+
+Lookups are cached on disk. A traceroute can produce thirty hops; asking a public
+API thirty times in a row is how a tool gets rate-limited and then reports
+nothing. Measured here: **1.4s to 22µs** for a cached lookup.
+
+A stale entry is still returned when a source fails, with `stale` set so the
+caller can say so. Serving yesterday's routing data as today's is the failure the
+flag exists to prevent.
+
+The RDAP decoder types `vcardArray` as a JSON **array**. Typing it as a string —
+which is how it first appeared here — made every response fail to parse, so the
+whole source was silently discarded and every answer came from one source that
+looked like two.
+
+---
+
 ## Architecture
 
 ```
-pkg/models/          every type that crosses a module boundary
-internal/dns/        the resolver: query building, sending, parsing
-cmd/netgraph/        the CLI
-cmd/probe/           a small driver used to exercise the resolver
+cmd/netgraph/          the CLI: main.go holds DNS, commands.go the rest
+cmd/asnprobe/          a driver for exercising ASN lookups live
+pkg/models/            every type that crosses a module boundary
+internal/dns/          query building, UDP and TCP transport, parsing
+internal/traceroute/   the route engine and the reply matcher
+internal/asn/          RIPEstat and RDAP, merged
+internal/cache/        the on-disk lookup cache
+internal/latency/      TCP round-trip measurement and statistics
+internal/watch/        change detection over time
+internal/render/       ASCII, table, CSV, JSON and HTML output
 ```
 
-`internal/` is importable as a library; nothing in the network core imports the
-CLI, so the traceroute engine will be usable without it.
+`internal/` is importable. Nothing in the network core imports the CLI.
 
 ---
 
 ## Permissions
 
-The DNS analyzer needs **no privileges at all**. It speaks ordinary UDP and TCP.
+The DNS analyzer, ASN lookup, latency measurement and every exporter need **no
+privileges at all**. They speak ordinary UDP and TCP.
 
-The traceroute engine, once written, will need a raw socket for ICMP:
+Traceroute needs a raw socket:
 
 ```console
 $ sudo setcap cap_net_raw+ep ./netgraph
 ```
 
 or run as root. On Linux, `net.ipv4.ping_group_range` can grant unprivileged ICMP
-datagram sockets instead, where the distribution allows it.
+datagram sockets, but those carry only echo request and reply — never the Time
+Exceeded messages traceroute reads. So that route does not work, and the message
+says so rather than blaming the network.
 
-UDP and TCP traceroute additionally need `CAP_NET_RAW` to read the ICMP Time
-Exceeded replies, which is why they cannot work where ICMP is filtered by the
-network at all. That limitation is reported in the output rather than shown as a
-route with missing hops.
+UDP and TCP traceroute need the socket too, to read the replies they provoke,
+which is why they cannot work where ICMP is filtered. That is reported in the
+output rather than shown as a route with missing hops.
 
 ---
 
@@ -311,19 +452,55 @@ route with missing hops.
 
 ```console
 $ go test ./...
+ok  	github.com/Xwalims/netgraph/internal/asn
+ok  	github.com/Xwalims/netgraph/internal/cache
 ok  	github.com/Xwalims/netgraph/internal/dns
+ok  	github.com/Xwalims/netgraph/internal/latency
+ok  	github.com/Xwalims/netgraph/internal/render
+ok  	github.com/Xwalims/netgraph/internal/traceroute
+ok  	github.com/Xwalims/netgraph/internal/watch
 ```
 
-36 test cases covering record-type parsing, response codes, name compression
+**115 tests.** They build synthetic packets rather than depending on a public
+resolver being up, because a suite that fails because 1.1.1.1 is slow is a suite
+that proves nothing about the decoder.
+
+The DNS suite covers record-type parsing, response codes, name compression
 including a deliberate pointer loop, TXT chunk concatenation, IPv6 address
-handling, context cancellation, and reverse-lookup behaviour -- including the
+handling, context cancellation, and reverse-lookup behaviour — including the
 nibble order of the generated `in-addr.arpa` and `ip6.arpa` names, checked
 against CPython's `ipaddress.reverse_pointer`.
 
-They build synthetic packets rather than depending on a public resolver being up,
-because a suite that fails because 1.1.1.1 is slow is a suite that tests nothing.
+Live behaviour is verified separately, against 1.1.1.1, 8.8.8.8, RIPEstat and
+RDAP — which is how the DNS and ASN bugs above were found.
 
-The live behaviour was verified separately, against 1.1.1.1 and 8.8.8.8.
+Three of these tests exist because they caught something:
+
+- **The cache reported a hit rate of 200%.** Every `Get` ends in one of three
+  outcomes — fresh hit, stale serve, or miss — and the denominator counted two
+  while the numerator counted three.
+- **Sub-millisecond timings were understated.** `Duration.Microseconds()` floors,
+  so 1.5µs printed as `1µs`. Every such measurement was biased low.
+- **Loss was read from a field rather than recomputed.** A hop built by any path
+  other than the engine's reported 0% while dropping two probes of three.
+
+---
+
+## Limitations
+
+**Traceroute needs `CAP_NET_RAW`.** No protocol avoids it.
+
+**`netgraph ping` measures TCP, not ICMP.** It works without privileges and gives
+a real end-to-end figure, but it is not the same number `ping` prints.
+
+**No GeoIP city.** Approximate location is a guess, and the tool does not make
+claims it cannot measure.
+
+**ASN data is a snapshot.** Routing changes; the cache is marked stale rather
+than silently refreshed.
+
+**The cache is not shared between concurrent runs.** Two traces at once may each
+fetch. It is a cache, not a lock.
 
 ---
 
