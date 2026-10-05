@@ -387,6 +387,12 @@ func parseAnswer(msg []byte, want RecordType) ([]Record, int, error) {
 		// slice on its own resolves those pointers against the wrong base
 		// address and the record is dropped -- see parseRecord.
 		record, ok := parseRecord(msg, rdStart, name, rrType, ttl, rdata)
+		if ok {
+			// The TTL came off the wire, so it is known. Records built by the
+			// system-resolver path leave this false, which is what lets the
+			// renderer tell "ttl=0" apart from "this source has no TTLs".
+			record.TTLKnown = true
+		}
 		if !ok {
 			continue
 		}

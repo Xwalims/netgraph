@@ -66,7 +66,7 @@ Requires Go 1.23 or newer. No third-party dependencies at runtime.
 $ netgraph dns example.com                    resolve with the system resolver
 $ netgraph dns example.com --server 1.1.1.1   query a specific nameserver
 $ netgraph dns example.com --type MX          one record type
-$ netgraph dns example.com --all              every record type
+$ netgraph dns example.com --all              every record type a name can have
 $ netgraph dns example.com --compare          several servers, and where they disagree
 $ netgraph dns 1.1.1.1 --reverse              PTR lookup
 $ netgraph dns example.com --json             machine-readable
@@ -76,8 +76,9 @@ Options:
 
 ```
   --server <addr>       query this nameserver instead of the system resolver
-  --type <record>       A, AAAA, MX, NS, TXT, SOA, SRV, CAA, CNAME, PTR
-  --all                 query every record type
+  --type <record>       A, AAAA, MX, NS, TXT, SOA, SRV, CAA, CNAME. Repeatable;
+                        duplicates are collapsed into one query.
+  --all                 every record type that applies to a name (no PTR)
   --compare             query several servers and report the differences
   --reverse             treat the argument as an address
   --timeout <duration>  per-query timeout (default 5s)
@@ -88,6 +89,10 @@ Options:
 
 Exit codes: `0` success, `1` the query worked but returned no records, `2` the query
 failed or the command is not implemented.
+
+A query that *failed* exits `2`, not `1`. The two are different facts — "this name
+has no records of that type" versus "I could not find out" — and a script that
+treats them the same reports a timed-out resolver as an authoritative answer.
 
 ---
 
@@ -189,6 +194,83 @@ heuristic, which was removed: it could only ever fire on a message that had no
 prefix, and it corrupts roughly one query in 65536, because the first two bytes
 of a DNS query are the transaction ID.
 
+### Four bugs that were found by running the binary
+
+The unit tests were green for all of these. Only running the command against a
+real nameserver exposed them, which is the whole argument for checking a
+resolver against the network rather than against itself.
+
+**`--reverse` ignored `--server` completely.** `lookupPTR` called
+`net.DefaultResolver.LookupAddr` unconditionally, so the tool printed
+`server 8.8.8.8` in its own header and then asked the operating system:
+
+```console
+$ # before the fix, against a server that does not exist at all
+$ netgraph dns 1.1.1.1 --reverse --server 203.0.113.1
+  DNS
+  name       1.1.1.1
+  server     203.0.113.1          <- printed, never queried
+
+  PTR    1 records  rtt=3.4ms  rcode=NOERROR
+        one.one.one.one
+```
+
+A user comparing resolvers was comparing nothing, and a reverse lookup could not
+be pointed at a server that does not share the local resolver's view of the zone.
+The query now goes to the configured server, and the reverse name is built here
+rather than left to the OS — which also means `--reverse` finally works for an
+address the local resolver has never heard of:
+
+```console
+$ netgraph dns 8.8.8.8 --reverse --server 1.1.1.1
+
+  DNS
+  name       8.8.8.8
+  server     1.1.1.1 (PTR is queried directly; no system resolver is used)
+  timeout    5s
+
+  PTR    1 records  rtt=18ms  rcode=NOERROR
+        dns.google                       ttl=73891
+```
+
+The nibble order in the generated `in-addr.arpa` / `ip6.arpa` name is verified
+against CPython's `ipaddress.reverse_pointer`, an independent implementation of
+the same rule.
+
+**A failed query exited `1`, which means "no records".** The documented codes were
+`0` success, `1` no records, `2` failure, and a query against a dead server
+exited `1` with `no records found` printed underneath it. A script checking for
+`1` was being told that a resolver which never answered had returned an empty
+authoritative answer. The three cases are now distinct:
+
+```console
+$ netgraph dns github.com --server 1.1.1.1 --type A >/dev/null; echo $?
+0
+$ netgraph dns nx-4b7c2d.example --server 1.1.1.1 --type A >/dev/null; echo $?
+1
+$ netgraph dns github.com --server 203.0.113.1 --type A >/dev/null; echo $?
+2
+```
+
+**`--quiet` printed the header block anyway.** The flag promises "values only, no
+headings", and it did suppress the per-type heading while still emitting the
+`DNS / name / server / timeout` preamble — which is precisely what a caller pipes
+into `xargs` does not want.
+
+**`--all` ended with an error about a name not being an address.** It walked
+`AllTypes`, and `AllTypes` contains `PTR`, so every `--all` on a name finished
+with `"google.com" is not an IP address, so PTR does not apply`. The failure was
+reported by the tool as an error line, so it read as a server problem rather than
+as a question that cannot apply to a name. `--all` now walks the forward types
+only.
+
+Two smaller fixes came out of the same run. A `ttl=0` was printed for records
+that came from the system resolver, which has no TTLs at all — the field is now
+marked known or unknown rather than conflated. And `Result.Warnings`, which the
+resolver fills in when a truncated UDP answer could not be retried over TCP, was
+never read by the CLI at all, so a partial answer looked complete; it is now
+printed, and carried in `--json`.
+
 ---
 
 ## Architecture
@@ -232,9 +314,11 @@ $ go test ./...
 ok  	github.com/Xwalims/netgraph/internal/dns
 ```
 
-60 test cases covering record-type parsing, response codes, name compression
+36 test cases covering record-type parsing, response codes, name compression
 including a deliberate pointer loop, TXT chunk concatenation, IPv6 address
-handling and context cancellation.
+handling, context cancellation, and reverse-lookup behaviour -- including the
+nibble order of the generated `in-addr.arpa` and `ip6.arpa` names, checked
+against CPython's `ipaddress.reverse_pointer`.
 
 They build synthetic packets rather than depending on a public resolver being up,
 because a suite that fails because 1.1.1.1 is slow is a suite that tests nothing.

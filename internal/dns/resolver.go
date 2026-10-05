@@ -4,9 +4,9 @@
 //
 // The standard resolver returns addresses and discards everything else: the
 // TTL, which nameserver answered, how long it took, whether the answer was a
-// CNAME chain, and which records exist that nobody asked for. All of that is the
-// interesting part when someone is working out why a name resolves the way it
-// does, which is what this tool is for.
+// CNAME chain, and which records exist that nobody asked for. All of that is
+// the interesting part when someone is working out why a name resolves the way
+// it does, which is what this tool is for.
 //
 // So queries are built and sent directly, and every field the user asked for is
 // captured on the way past.
@@ -48,6 +48,16 @@ const (
 var AllTypes = []RecordType{
 	TypeA, TypeAAAA, TypeCNAME, TypeMX, TypeNS,
 	TypeTXT, TypeSOA, TypeSRV, TypeCAA, TypePTR,
+}
+
+// ForwardTypes is every record type that applies to a name rather than to an
+// address. It exists because `--all` used to walk AllTypes, which included PTR:
+// asking a forward question for an address produces the error "google.com is not
+// an IP address" in the middle of an otherwise successful `--all`, which reads
+// as the server failing rather than as the question being nonsense.
+var ForwardTypes = []RecordType{
+	TypeA, TypeAAAA, TypeCNAME, TypeMX, TypeNS,
+	TypeTXT, TypeSOA, TypeSRV, TypeCAA,
 }
 
 // dnsType maps a RecordType to its numeric value for the wire query.
@@ -127,6 +137,10 @@ type Result struct {
 }
 
 // Record is one answer, normalised away from the wire format.
+//
+// A TTL of zero means "the source did not tell us", not "expire immediately".
+// The system resolver does not expose TTLs, so a record that came from it
+// carries zero and the renderer says so rather than printing a confident 0.
 type Record struct {
 	Name     string
 	Type     RecordType
@@ -135,6 +149,10 @@ type Record struct {
 	Priority uint16
 	Weight   uint16
 	Port     uint16
+
+	// TTLKnown is false when the answering path had no TTL to report, which is
+	// the case for every record that came from the system resolver.
+	TTLKnown bool
 }
 
 // rcodeName explains a DNS response code.
@@ -175,10 +193,12 @@ func (r *Resolver) Lookup(ctx context.Context, name, recordType string) (*Result
 	queryCtx, cancel := context.WithTimeout(ctx, r.options.Timeout)
 	defer cancel()
 
-	// A PTR query is the reverse direction: the name on the wire is derived from
-	// the address. Handling it here rather than in the caller keeps the record
-	// type and the query shape from getting out of step.
 	if parsed == TypePTR {
+		// A PTR query is the reverse direction: the name on the wire is derived
+		// from the address, so an IP address is accepted here and turned into
+		// the in-addr.arpa / ip6.arpa name itself. Doing that here rather than
+		// in the caller keeps the record type and the query shape from getting
+		// out of step.
 		return r.lookupPTR(queryCtx, name)
 	}
 
@@ -186,13 +206,21 @@ func (r *Resolver) Lookup(ctx context.Context, name, recordType string) (*Result
 		return r.lookupSystem(queryCtx, name, parsed)
 	}
 
-	// The first server that answers wins. Failing the whole lookup because one
-	// server is down would be wrong for a diagnostic tool: the point is to find
-	// out what each server says.
+	return r.lookupServers(queryCtx, name, parsed, r.options.Servers)
+}
+
+// lookupServers asks each configured server in turn and returns the first answer.
+//
+// The first server that answers wins. Failing the whole lookup because one
+// server is down would be wrong for a diagnostic tool: the point is to find
+// out what each server says.
+func (r *Resolver) lookupServers(
+	ctx context.Context, name string, parsed RecordType, servers []string,
+) (*Result, error) {
 	query := buildQuery(name, dnsType[parsed], nextQueryID())
 	var lastErr error
-	for i, server := range r.options.Servers {
-		result, err := r.queryServer(queryCtx, server, query, name, parsed, false, i == 0)
+	for i, server := range servers {
+		result, err := r.queryServer(ctx, server, query, name, parsed, false, i == 0)
 		if err == nil {
 			return result, nil
 		}
@@ -222,8 +250,9 @@ func (r *Resolver) lookupSystem(ctx context.Context, name string, parsed RecordT
 		Response: rcodeName(0),
 	}
 	// A TTL is not exposed by the system resolver. Reporting the elapsed query
-	// time as a TTL would be a fabrication, so TTL is left at zero and the
-	// field is omitted when rendered.
+	// time as a TTL would be a fabrication, so TTL stays zero and TTLKnown
+	// stays false, which is what makes the renderer omit the field instead of
+	// printing a confident "ttl=0".
 	for _, addr := range addrs {
 		ip := net.ParseIP(addr)
 		if ip == nil {
@@ -251,12 +280,37 @@ func (r *Resolver) lookupSystem(ctx context.Context, name string, parsed RecordT
 }
 
 // lookupPTR reverses an address into a name.
+//
+// The reverse name is derived here rather than handed in by the caller, so the
+// caller's argument is always an address and never a half-built arpa name.
+//
+// When servers are configured the query goes to them directly. This used to
+// call net.DefaultResolver.LookupAddr unconditionally, which meant --server was
+// silently ignored for every reverse lookup: the tool printed the server in its
+// own header and then asked the operating system instead. A user comparing
+// resolvers was comparing nothing, and a reverse lookup could not be pointed at
+// a server that does not share the local resolver's view of the zone.
 func (r *Resolver) lookupPTR(ctx context.Context, address string) (*Result, error) {
-	if net.ParseIP(address) == nil {
+	ip := net.ParseIP(address)
+	if ip == nil {
 		return nil, fmt.Errorf("%q is not an IP address, so PTR does not apply", address)
 	}
+	arpaName := reverseName(ip)
+
+	if len(r.options.Servers) > 0 {
+		result, err := r.lookupServers(ctx, arpaName, TypePTR, r.options.Servers)
+		if err != nil {
+			return nil, fmt.Errorf("reverse lookup of %s: %w", address, err)
+		}
+		// The name on the wire is the arpa form; the user asked about the
+		// address, so Result.Name reports the address.
+		result.Name = address
+		return result, nil
+	}
+
 	start := time.Now()
 	names, err := net.DefaultResolver.LookupAddr(ctx, address)
+	elapsed := time.Since(start)
 	if err != nil {
 		return nil, fmt.Errorf("reverse lookup: %w", err)
 	}
@@ -264,7 +318,7 @@ func (r *Resolver) lookupPTR(ctx context.Context, address string) (*Result, erro
 		Name:     address,
 		Type:     TypePTR,
 		Server:   "system resolver",
-		RTT:      time.Since(start),
+		RTT:      elapsed,
 		Response: rcodeName(0),
 	}
 	for _, n := range names {
@@ -273,4 +327,33 @@ func (r *Resolver) lookupPTR(ctx context.Context, address string) (*Result, erro
 		})
 	}
 	return result, nil
+}
+
+// reverseName is the in-addr.arpa or ip6.arpa name for an address.
+//
+// The order is not a choice. An IPv4 address reverses as whole octets in
+// reverse; an IPv6 address reverses as individual nibbles in reverse. Both are
+// fixed by RFC 1035 and by what every resolver since has done, so getting
+// either wrong makes the query ask about a different address than the user
+// named, and that failure is silent: an empty answer for a name nobody hosts.
+func reverseName(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa", v4[3], v4[2], v4[1], v4[0])
+	}
+	v6 := ip.To16()
+	if v6 == nil {
+		return ""
+	}
+	const hex = "0123456789abcdef"
+	out := make([]byte, 0, len(v6)*4+len(".ip6.arpa"))
+	for i := len(v6) - 1; i >= 0; i-- {
+		if len(out) > 0 {
+			out = append(out, '.')
+		}
+		// Low nibble first: the last octet's least significant nibble leads.
+		out = append(out, hex[v6[i]&0x0f], '.', hex[v6[i]>>4])
+	}
+	// The dot matters: "…0.2ip6.arpa" is not a name the ip6.arpa zone serves,
+	// and the query for it fails silently as an empty answer.
+	return string(out) + ".ip6.arpa"
 }

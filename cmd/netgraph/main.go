@@ -48,8 +48,9 @@ Usage:
 Options for dns:
   --server <addr>       query this nameserver instead of the system resolver
   --type <record>       query one record type (A, AAAA, MX, NS, TXT, SOA,
-                        SRV, CAA, CNAME). Repeats are not allowed.
-  --all                query every record type
+                        SRV, CAA, CNAME). May be repeated; duplicates are
+                        collapsed.
+  --all                query every record type that applies to a name
   --compare            query several servers and report the differences
   --reverse            treat the argument as an address and do a PTR lookup
   --timeout <duration>  per-query timeout (default 5s)
@@ -67,8 +68,18 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
-// notImplemented keeps the exit code for an unimplemented command in one place.
-const exitUnimplemented = 2
+// Exit codes, in one place.
+//
+// A failed query must be distinguishable from a successful query that found
+// nothing: 1 means "the name has no such records", 2 means "I could not find
+// out". Collapsing them told a script that a timed-out resolver had answered,
+// which is the specific failure this tool exists to catch.
+const (
+	exitOK            = 0
+	exitNoRecords     = 1
+	exitUnimplemented = 2
+	exitQueryFailed   = 2
+)
 
 func run(args []string) int {
 	if len(args) == 0 {
@@ -79,10 +90,10 @@ func run(args []string) int {
 	switch args[0] {
 	case "help", "-h", "--help":
 		fmt.Print(usageFmt())
-		return 0
+		return exitOK
 	case "version", "--version", "-v":
 		fmt.Printf("netgraph %s\n", version)
-		return 0
+		return exitOK
 	case "dns":
 		return runDNS(args[1:])
 	}
@@ -203,15 +214,10 @@ func runDNS(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	types := flags.types
-	if flags.reverse {
-		types = []string{"PTR"}
-	}
-	if flags.all {
-		types = allTypeNames()
-	}
-	if len(types) == 0 {
-		types = []string{"A", "AAAA"}
+	types, err := requestedTypes(flags)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "netgraph dns: %v\n", err)
+		return exitUnimplemented
 	}
 
 	if flags.compare {
@@ -220,12 +226,47 @@ func runDNS(args []string) int {
 	return runDNSSingle(ctx, name, types, flags)
 }
 
-func allTypeNames() []string {
-	names := make([]string, 0, len(dns.AllTypes))
-	for _, t := range dns.AllTypes {
-		names = append(names, string(t))
+// requestedTypes decides which record types to ask for, and rejects nonsense
+// before any query is sent.
+//
+// --all walks the forward types only. PTR asks about an address rather than a
+// name, so including it made every --all end with the error "google.com is not
+// an IP address", which reads as a server failure rather than as a question
+// that cannot apply.
+func requestedTypes(flags dnsFlags) ([]string, error) {
+	if flags.reverse {
+		return []string{"PTR"}, nil
 	}
-	return names
+	if flags.all {
+		names := make([]string, 0, len(dns.ForwardTypes))
+		for _, t := range dns.ForwardTypes {
+			names = append(names, string(t))
+		}
+		return names, nil
+	}
+	if len(flags.types) == 0 {
+		return []string{"A", "AAAA"}, nil
+	}
+
+	// Repeats are collapsed rather than rejected: "--type A --type A" is a
+	// typo, and re-running the same query and printing the answer twice is
+	// noise, not a different answer. What matters is that the user sees one
+	// result for the type they named.
+	seen := map[string]bool{}
+	types := make([]string, 0, len(flags.types))
+	for _, raw := range flags.types {
+		parsed, err := dns.ParseRecordType(raw)
+		if err != nil {
+			return nil, err
+		}
+		key := string(parsed)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		types = append(types, key)
+	}
+	return types, nil
 }
 
 func runDNSSingle(ctx context.Context, name string, types []string, flags dnsFlags) int {
@@ -239,30 +280,67 @@ func runDNSSingle(ctx context.Context, name string, types []string, flags dnsFla
 		return runDNSJSON(ctx, resolver, name, types, flags)
 	}
 
-	fmt.Printf("\n  %s\n", heading("DNS", flags.colour))
-	fmt.Printf("  %s %s\n", pad("name", 10), name)
-	fmt.Printf("  %s %s\n", pad("server", 10), serverLabel(flags.server))
-	fmt.Printf("  %s %s\n\n", pad("timeout", 10), flags.timeout)
+	// --quiet promises "values only, no headings". The DNS/name/server header
+	// block used to print anyway, which broke the one mode a script would use
+	// to pipe values into something else.
+	if !flags.quiet {
+		fmt.Printf("\n  %s\n", heading("DNS", flags.colour))
+		fmt.Printf("  %s %s\n", pad("name", 10), name)
+		fmt.Printf("  %s %s\n", pad("server", 10), serverLabel(flags.server, flags.reverse))
+		fmt.Printf("  %s %s\n\n", pad("timeout", 10), flags.timeout)
+	}
 
 	total := 0
+	failed := false
 	for _, recordType := range types {
 		result, err := resolver.Lookup(ctx, name, recordType)
 		if err != nil {
-			fmt.Printf("  %s %s\n", pad(recordType, 6), dim("error: "+err.Error(), flags.colour))
+			failed = true
+			if flags.quiet {
+				fmt.Fprintf(os.Stderr, "%s: %v\n", recordType, err)
+			} else {
+				fmt.Printf("  %s %s\n", pad(recordType, 6), dim("error: "+err.Error(), flags.colour))
+			}
 			continue
 		}
 		total += printRecords(result, flags)
 	}
 
-	fmt.Printf("\n")
-	if total == 0 {
-		fmt.Printf("  no records found\n")
-		return 1
+	if !flags.quiet {
+		fmt.Printf("\n")
 	}
-	return 0
+	switch {
+	case failed:
+		// At least one question could not be answered. Saying "no records
+		// found" here claimed the name has no records of that type, when the
+		// truth is that the resolver never replied.
+		if !flags.quiet {
+			fmt.Printf("  the query failed against at least one nameserver\n")
+		}
+		return exitQueryFailed
+	case total == 0:
+		if !flags.quiet {
+			fmt.Printf("  no records found\n")
+		}
+		return exitNoRecords
+	}
+	return exitOK
 }
 
 func printRecords(result *dns.Result, flags dnsFlags) int {
+	if flags.quiet {
+		for _, record := range result.Records {
+			fmt.Println(record.Value)
+		}
+		// Warnings still go to stderr in quiet mode: quiet controls stdout's
+		// shape, not whether the tool is allowed to say it knows less than it
+		// was asked for.
+		for _, warning := range result.Warnings {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
+		}
+		return len(result.Records)
+	}
+
 	meta := fmt.Sprintf("%d records  rtt=%s  rcode=%s",
 		len(result.Records),
 		result.RTT.Round(time.Microsecond*100),
@@ -271,26 +349,31 @@ func printRecords(result *dns.Result, flags dnsFlags) int {
 	if result.Truncated {
 		meta += "  TRUNCATED"
 	}
-	if flags.quiet {
-		for _, record := range result.Records {
-			fmt.Println(record.Value)
-		}
-		return len(result.Records)
-	}
-
 	fmt.Printf("  %s %s\n", pad(string(result.Type), 6), dim(meta, flags.colour))
 	if result.RCode != 0 && len(result.Records) == 0 {
 		fmt.Printf("        %s\n", dim("the name has no records of this type (rcode "+result.Response+")", flags.colour))
 	}
+	// A warning that never reaches the user makes a partial answer look
+	// complete, which is the exact thing the resolver went out of its way to
+	// record.
+	for _, warning := range result.Warnings {
+		fmt.Printf("        %s\n", dim("warning: "+warning, flags.colour))
+	}
 	for _, record := range result.Records {
-		line := fmt.Sprintf("        %-32s ttl=%d", record.Value, record.TTL)
+		line := fmt.Sprintf("        %-32s", record.Value)
+		if record.TTLKnown {
+			line += fmt.Sprintf(" ttl=%d", record.TTL)
+		}
 		if record.Priority != 0 {
 			line += fmt.Sprintf("  priority=%d", record.Priority)
 		}
 		if record.Port != 0 {
 			line += fmt.Sprintf("  weight=%d port=%d", record.Weight, record.Port)
 		}
-		fmt.Println(line)
+		// The value column is padded for alignment, so a record with no TTL
+		// and no priority ends in whitespace. Trailing blanks make a diff of
+		// two runs look like something changed when nothing did.
+		fmt.Println(strings.TrimRight(line, " "))
 	}
 	fmt.Println()
 	return len(result.Records)
@@ -307,6 +390,7 @@ func runDNSCompare(ctx context.Context, name string, types []string, flags dnsFl
 
 	type serverResult struct {
 		Server  string   `json:"server"`
+		Type    string   `json:"type"`
 		Records []string `json:"records"`
 		Error   string   `json:"error,omitempty"`
 		RTT     string   `json:"rtt"`
@@ -317,7 +401,7 @@ func runDNSCompare(ctx context.Context, name string, types []string, flags dnsFl
 		for _, recordType := range types {
 			resolver := dns.New(dns.Options{Servers: []string{server}, Timeout: flags.timeout})
 			result, err := resolver.Lookup(ctx, name, recordType)
-			entry := serverResult{Server: server}
+			entry := serverResult{Server: server, Type: recordType}
 			if err != nil {
 				entry.Error = err.Error()
 			} else {
@@ -340,7 +424,7 @@ func runDNSCompare(ctx context.Context, name string, types []string, flags dnsFl
 
 	fmt.Printf("\n  %s   %s\n\n", heading("DNS comparison", flags.colour), name)
 	for _, entry := range results {
-		fmt.Printf("  %s\n", pad(entry.Server, 12))
+		fmt.Printf("  %s\n", pad(entry.Server+"/"+entry.Type, 16))
 		if entry.Error != "" {
 			fmt.Printf("        %s\n", dim("error: "+entry.Error, flags.colour))
 			continue
@@ -353,7 +437,15 @@ func runDNSCompare(ctx context.Context, name string, types []string, flags dnsFl
 
 	// Report agreement explicitly rather than leaving the reader to compare.
 	byType := map[string]map[string][]string{}
+	// A server that failed contributed nothing to the tally, so its silence
+	// used to read as agreement. "two resolvers agree" when one of the three
+	// never answered is a claim the data does not support.
+	unverified := map[string]bool{}
 	for _, entry := range results {
+		if entry.Error != "" {
+			unverified[entry.Type] = true
+			continue
+		}
 		for _, record := range entry.Records {
 			fields := strings.SplitN(record, " ", 2)
 			recordType := fields[0]
@@ -374,6 +466,7 @@ func runDNSCompare(ctx context.Context, name string, types []string, flags dnsFl
 		typesSeen = append(typesSeen, recordType)
 	}
 	sort.Strings(typesSeen)
+
 	divergent := false
 	for _, recordType := range typesSeen {
 		values := byType[recordType]
@@ -381,6 +474,18 @@ func runDNSCompare(ctx context.Context, name string, types []string, flags dnsFl
 			value := ""
 			for v := range values {
 				value = v
+			}
+			if unverified[recordType] {
+				fmt.Printf("    %s %s\n", pad(recordType, 8),
+					dim("UNVERIFIED: only the servers that answered were counted", flags.colour))
+				continue
+			}
+			if len(servers) < 2 {
+				// One server cannot disagree with itself. Calling that
+				// "consistent" would read as a finding.
+				fmt.Printf("    %s %s\n", pad(recordType, 8),
+					dim(fmt.Sprintf("single server: %s", value), flags.colour))
+				continue
 			}
 			fmt.Printf("    %s %s\n", pad(recordType, 8), dim("consistent: "+value, flags.colour))
 			continue
@@ -397,10 +502,26 @@ func runDNSCompare(ctx context.Context, name string, types []string, flags dnsFl
 		}
 	}
 	fmt.Println()
-	if divergent {
-		return 0 // A divergence is a finding, not a failure.
+
+	// A server that could not be reached leaves the question partly unanswered,
+	// so it is a failure of the run even when the answers that did arrive agree.
+	for _, recordType := range sortedKeys(unverified) {
+		fmt.Fprintf(os.Stderr, "netgraph: %s could not be verified on at least one server\n", recordType)
+		return exitQueryFailed
 	}
-	return 0
+	if divergent {
+		return exitOK // A divergence is a finding, not a failure.
+	}
+	return exitOK
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // dnsJSONResult is the machine-readable shape, kept as a named type so the
@@ -418,12 +539,15 @@ type dnsJSONRecord struct {
 	Response  string   `json:"response"`
 	Truncated bool     `json:"truncated"`
 	Values    []string `json:"values"`
+	TTL       []uint32 `json:"ttl,omitempty"`
 	Error     string   `json:"error,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 func runDNSJSON(ctx context.Context, resolver *dns.Resolver, name string, types []string, flags dnsFlags) int {
-	output := dnsJSONResult{Name: name, Server: serverLabel(flags.server)}
+	output := dnsJSONResult{Name: name, Server: serverLabel(flags.server, flags.reverse)}
 	total := 0
+	failed := false
 
 	for _, recordType := range types {
 		result, err := resolver.Lookup(ctx, name, recordType)
@@ -431,24 +555,32 @@ func runDNSJSON(ctx context.Context, resolver *dns.Resolver, name string, types 
 		if err != nil {
 			entry.Error = err.Error()
 			output.Results = append(output.Results, entry)
+			failed = true
 			continue
 		}
 		entry.RTT = result.RTT.Round(time.Microsecond * 100).String()
 		entry.RCode = result.RCode
 		entry.Response = result.Response
 		entry.Truncated = result.Truncated
+		entry.Warnings = result.Warnings
 		for _, record := range result.Records {
 			entry.Values = append(entry.Values, record.Value)
+			if record.TTLKnown {
+				entry.TTL = append(entry.TTL, record.TTL)
+			}
 		}
 		total += len(entry.Values)
 		output.Results = append(output.Results, entry)
 	}
 
 	printJSON(output)
-	if total == 0 {
-		return 1
+	if failed {
+		return exitQueryFailed
 	}
-	return 0
+	if total == 0 {
+		return exitNoRecords
+	}
+	return exitOK
 }
 
 func printJSON(payload any) int {
@@ -458,17 +590,27 @@ func printJSON(payload any) int {
 		return exitUnimplemented
 	}
 	fmt.Println(string(encoded))
-	return 0
+	return exitOK
 }
 
-func serverLabel(server string) string {
-	if server == "" {
-		return "system resolver"
+// serverLabel describes who was actually asked.
+//
+// A PTR lookup used to ignore --server and go to the operating system's
+// resolver, and this function printed the requested server anyway, so the output
+// named a nameserver that had never been queried. Both branches say "system
+// resolver" because that is the only path that reaches one, but the reverse
+// case is spelled out so a future fix has to change this and not just the
+// resolver.
+func serverLabel(server string, reverse bool) string {
+	if server != "" {
+		if reverse {
+			return server + " (PTR is queried directly; no system resolver is used)"
+		}
+		return server
 	}
-	return server
+	return "system resolver"
 }
 
-// colourEnabled honours NO_COLOR and only uses colour on a terminal.
 func colourEnabled() bool {
 	if os.Getenv("NO_COLOR") != "" {
 		return false
