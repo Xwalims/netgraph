@@ -54,7 +54,7 @@ Usage:
   netgraph compare <a> <b>...    trace several targets and diff the paths
   netgraph export                re-render a saved result in another format
   netgraph cache [cmd]           stats, clear or sweep the lookup cache
-  netgraph watch <target>        monitor a route (not yet implemented)
+  netgraph watch <target>        monitor a target and report changes
   netgraph version               print the version
   netgraph help                  print this message
 
@@ -73,7 +73,18 @@ Options for ip, asn and ping:
   --interval <duration>        pause between probes (default 1s)
   --continuous                 keep sending until interrupted
   --port <n>                   TCP port to measure against (default 443)
+  --timeout <duration>         per-probe timeout
   --no-cache                   refetch instead of using the cache
+
+Options for watch:
+  --interval <duration>        time between checks (default 30s, minimum 1s)
+  --count <n>                  checks to run, 0 for unlimited (default 0)
+  --type <record>              DNS record type to watch for changes
+  --server <address>           nameserver for that query
+  --trace                      also trace each interval (needs CAP_NET_RAW)
+
+The first watch check establishes a baseline and reports nothing, so the output
+describes changes rather than describing the target.
 
 Options for dns:
   --server <addr>       query this nameserver instead of the system resolver
