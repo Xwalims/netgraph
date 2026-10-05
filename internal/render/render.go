@@ -197,9 +197,20 @@ func Rows(route *models.Route) []TableRow {
 		// and forgets the derived field, would otherwise report 0% loss on a hop
 		// that dropped two probes of three -- the one number that must never be
 		// wrong on a network diagnostic.
+		//
+		// The recomputation is unconditional. It used to apply only when the
+		// counts disagreed, which left the stale field in charge exactly when it
+		// was least likely to be noticed: a hop with Sent == Received renders the
+		// field verbatim, so a Hop carrying Loss 0.5 alongside 3/3 answered printed
+		// "50%" on a hop that dropped nothing. Sent is also floored at Received,
+		// because loss is a fraction and cannot exceed 1 or go negative.
 		loss := hop.Loss
-		if hop.Sent > 0 && hop.Received >= 0 && hop.Received != hop.Sent {
-			loss = float64(hop.Sent-hop.Received) / float64(hop.Sent)
+		if hop.Sent > 0 {
+			sent := hop.Sent
+			if hop.Received > sent {
+				sent = hop.Received
+			}
+			loss = float64(sent-hop.Received) / float64(sent)
 		}
 
 		rows = append(rows, TableRow{

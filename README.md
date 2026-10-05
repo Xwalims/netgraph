@@ -374,7 +374,22 @@ trip is computed.
 
 **A port collision test.** Two probes in flight sharing a port could not be told
 apart, and one hop's timing could be attributed to another. There is a test that
-enumerates every port across the default range and fails on a repeat.
+enumerates every port across the default range and fails on a repeat — and it
+has to run at **every** probe count the `--probes` flag accepts, not just the
+default. The stride between TTLs is the maximum probe count, so checking only the
+default leaves the whole range above it untested: with a stride of 8, `--probes 9`
+put TTL 2's first probe on port 33450, which TTL 1's ninth probe had already used,
+and the send record was silently overwritten. That is a hop at the wrong distance,
+which is the one error a traceroute exists to avoid.
+
+**A probe is counted once, however many replies arrive.** `collect` keys its
+de-duplication on the probe's port, so a router that answers twice does not make
+`Received` exceed `Sent`. Without that, loss is computed as
+`(Sent - Received) / Sent` and the report printed **-133%** — three probes sent,
+seven replies received. Loss is a fraction, so `buildHops` also refuses to let
+`Received` exceed `Sent` whatever reaches it. A probe's port is released as soon
+as its measurement window closes, so a reply arriving late is discarded instead of
+being attributed to a hop it never reached.
 
 **Capability is checked before probing.** All three protocols need the socket,
 not just ICMP: UDP and TCP are identified by the replies they provoke. So the
@@ -461,7 +476,7 @@ ok  	github.com/Xwalims/netgraph/internal/traceroute
 ok  	github.com/Xwalims/netgraph/internal/watch
 ```
 
-**115 tests.** They build synthetic packets rather than depending on a public
+**120 tests.** They build synthetic packets rather than depending on a public
 resolver being up, because a suite that fails because 1.1.1.1 is slow is a suite
 that proves nothing about the decoder.
 

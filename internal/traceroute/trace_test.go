@@ -1,8 +1,10 @@
 package traceroute
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
+	"time"
 )
 
 // TestQuotedPortIPv4 checks that a probe's destination port is recovered from
@@ -217,22 +219,42 @@ func TestDestinationAnswered(t *testing.T) {
 	}
 }
 
-// TestProbePortsAreUnique is the property the whole matching scheme rests on: if
-// two probes in flight share a destination port, their replies cannot be told
-// apart and one hop's timing can be attributed to another.
-func TestProbePortsAreUnique(t *testing.T) {
-	seen := map[int]bool{}
-	for ttl := 1; ttl <= DefaultMaxHops; ttl++ {
-		for probe := 0; probe < DefaultProbes; probe++ {
-			port := firstProbePort + ttl*8 + probe
-			if port > 65535 {
-				t.Fatalf("port %d for ttl=%d probe=%d exceeds the port range", port, ttl, probe)
+// TestProbePortsAreUniqueAtEveryAllowedProbeCount is the property the whole
+// matching scheme rests on: if two probes in flight share a destination port,
+// their replies cannot be told apart and one hop's timing can be attributed to
+// another.
+//
+// It has to hold at MaxProbes, not just at DefaultProbes. The stride between
+// TTLs is MaxProbes, so enumerating only the default missed the entire range
+// above it: with the old stride of 8, `--probes 9` (accepted by the CLI) put
+// TTL 2's first probe on port 33450, which TTL 1's ninth probe had already
+// used, and t.recordSend silently overwrote the earlier entry.
+func TestProbePortsAreUniqueAtEveryAllowedProbeCount(t *testing.T) {
+	for probes := 1; probes <= MaxProbes; probes++ {
+		seen := map[int]bool{}
+		for ttl := 1; ttl <= DefaultMaxHops; ttl++ {
+			for probe := 0; probe < probes; probe++ {
+				port := probePort(ttl, probe)
+				if port > 65535 {
+					t.Fatalf("probes=%d: port %d for ttl=%d probe=%d exceeds the port range",
+						probes, port, ttl, probe)
+				}
+				if seen[port] {
+					t.Fatalf("probes=%d: port %d is used twice, at ttl=%d probe=%d",
+						probes, port, ttl, probe)
+				}
+				seen[port] = true
 			}
-			if seen[port] {
-				t.Fatalf("port %d is used twice, at ttl=%d probe=%d", port, ttl, probe)
-			}
-			seen[port] = true
 		}
+	}
+}
+
+// TestProbePortsFitInTheRange is the other half: with MaxProbes as the stride
+// and MaxHops allowed up to 255, the last probe must still be a legal port.
+func TestProbePortsFitInTheRange(t *testing.T) {
+	last := probePort(255, MaxProbes-1)
+	if last > 65535 {
+		t.Errorf("the highest permitted TTL and probe count yields port %d, past 65535", last)
 	}
 }
 
@@ -270,5 +292,103 @@ func TestResolveTargetRejectsWrongFamily(t *testing.T) {
 	got, err := resolveTarget("1.1.1.1", false)
 	if err != nil || got != "1.1.1.1" {
 		t.Fatalf("resolveTarget: got %q, %v", got, err)
+	}
+}
+
+// TestCollectCountsAProbeOnce checks that one probe yields one result, however
+// many replies arrive for it.
+//
+// collect used to append every result it was handed and its only guard was a
+// `seen` map written but never read -- keyed on TTL, so it could not have
+// deduplicated per probe even if it had been read. A router that answered twice
+// put the hop's Received above its Sent, and buildHops then computed
+// loss = (Sent-Received)/Sent, so the report claimed a negative loss: three
+// probes sent and seven replies received rendered as -133%.
+func TestCollectCountsAProbeOnce(t *testing.T) {
+	tr := &tracer{options: Options{Probes: 3, MaxHops: DefaultMaxHops}, sent: map[int]pending{}}
+
+	var ports []int
+	for probe := 0; probe < tr.options.Probes; probe++ {
+		port := probePort(1, probe)
+		ports = append(ports, port)
+		tr.recordSend(port, 1)
+	}
+
+	replies := make(chan probeResult, len(ports)*3)
+	for _, port := range ports {
+		record := tr.sent[port]
+		// Each probe's reply arrives three times.
+		for i := 0; i < 3; i++ {
+			replies <- probeResult{TTL: record.ttl, Port: port, RTT: time.Since(record.sentAt), Address: "198.51.100.1"}
+		}
+	}
+	close(replies)
+
+	results := map[int][]probeResult{}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	tr.collect(ctx, replies, results)
+
+	hops := buildHops(results, tr.options.Probes)
+	if len(hops) != 1 {
+		t.Fatalf("expected one hop, got %d", len(hops))
+	}
+	hop := hops[0]
+	if hop.Received != tr.options.Probes {
+		t.Errorf("received %d, want %d: a duplicated reply was counted as another probe",
+			hop.Received, tr.options.Probes)
+	}
+	if hop.Received > hop.Sent {
+		t.Errorf("received %d exceeds sent %d", hop.Received, hop.Sent)
+	}
+	if hop.Loss != 0 {
+		t.Errorf("loss %v, want 0: every probe answered", hop.Loss)
+	}
+}
+
+// TestBuildHopsNeverReportsNegativeLoss is the floor under the arithmetic.
+//
+// collect() now deduplicates, so a hop cannot receive more replies than probes
+// through the normal path -- but loss is a fraction and must never render as a
+// negative percentage whatever reaches this function.
+func TestBuildHopsNeverReportsNegativeLoss(t *testing.T) {
+	results := map[int][]probeResult{
+		1: {
+			{TTL: 1, Port: 1, RTT: time.Millisecond},
+			{TTL: 1, Port: 2, RTT: time.Millisecond},
+			{TTL: 1, Port: 3, RTT: time.Millisecond},
+			{TTL: 1, Port: 4, RTT: time.Millisecond},
+		},
+	}
+
+	hops := buildHops(results, 3)
+	if len(hops) != 1 {
+		t.Fatalf("expected one hop, got %d", len(hops))
+	}
+	if hops[0].Received > hops[0].Sent {
+		t.Errorf("received %d exceeds sent %d", hops[0].Received, hops[0].Sent)
+	}
+	if hops[0].Loss < 0 || hops[0].Loss > 1 {
+		t.Errorf("loss %v is outside [0,1]", hops[0].Loss)
+	}
+}
+
+// TestForgetClosesThePortAfterTheWindow covers the send table's lifetime.
+//
+// forget() existed and was called only from a test, so every probe of every hop
+// stayed in t.sent for the whole trace. A late reply to a closed window was then
+// matched against a stale record and attributed to a hop it never reached.
+func TestForgetClosesThePortAfterTheWindow(t *testing.T) {
+	tr := &tracer{sent: map[int]pending{}}
+
+	port := probePort(1, 0)
+	tr.recordSend(port, 1)
+	if ttl := tr.ttlFor(port); ttl != 1 {
+		t.Fatalf("a recorded probe should resolve to its ttl, got %d", ttl)
+	}
+
+	tr.forget([]int{port})
+	if ttl := tr.ttlFor(port); ttl != 0 {
+		t.Errorf("a forgotten port still resolves to ttl %d, so a late reply could be attributed", ttl)
 	}
 }

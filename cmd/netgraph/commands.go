@@ -162,8 +162,8 @@ func traceOptionsOf(f cmdFlags) (cmdFlags, traceroute.Options, error) {
 	if options.MaxHops < 1 || options.MaxHops > 255 {
 		return f, traceroute.Options{}, fmt.Errorf("--max-hops %d is out of range; a TTL is 1..255", options.MaxHops)
 	}
-	if options.Probes < 1 || options.Probes > 20 {
-		return f, traceroute.Options{}, fmt.Errorf("--probes %d is out of range; use 1..20", options.Probes)
+	if options.Probes < 1 || options.Probes > traceroute.MaxProbes {
+		return f, traceroute.Options{}, fmt.Errorf("--probes %d is out of range; use 1..%d", options.Probes, traceroute.MaxProbes)
 	}
 	return f, options, nil
 }

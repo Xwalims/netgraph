@@ -135,6 +135,50 @@ func TestRowsAreOrderedAndComplete(t *testing.T) {
 	}
 }
 
+// TestRowsIgnoreAStaleLossField checks the recomputation is unconditional.
+//
+// The guard used to read `if Sent > 0 && Received != Sent`, which left Hop.Loss
+// in charge precisely when it was hardest to notice: a hop whose probes all
+// answered. A Hop carrying a stale 0.5 next to 3 sent / 3 received printed
+// "50%" for a hop that dropped nothing.
+func TestRowsIgnoreAStaleLossField(t *testing.T) {
+	cases := []struct {
+		name string
+		hop  models.Hop
+		want string
+	}{
+		{
+			"stale field, all probes answered",
+			models.Hop{Number: 1, Sent: 3, Received: 3, Loss: 0.5},
+			"0%",
+		},
+		{
+			"stale field, every probe lost",
+			models.Hop{Number: 2, Sent: 3, Received: 0, Loss: 0},
+			"100%",
+		},
+		{
+			"received above sent is not a negative loss",
+			models.Hop{Number: 3, Sent: 3, Received: 5, Loss: 0},
+			"0%",
+		},
+		{
+			"consistent counts",
+			models.Hop{Number: 4, Sent: 4, Received: 1, Loss: 0.75},
+			"75%",
+		},
+	}
+
+	for _, c := range cases {
+		route := routeWith(c.hop)
+		rows := Rows(route)
+		if rows[0].Loss != c.want {
+			t.Errorf("%s: sent=%d received=%d field=%.2f rendered %q, want %q",
+				c.name, c.hop.Sent, c.hop.Received, c.hop.Loss, rows[0].Loss, c.want)
+		}
+	}
+}
+
 // TestCSVQuotesFieldsThatNeedIt covers the escaping, because a CSV reader that
 // strips quotes unconditionally turns a value containing a comma into two
 // columns and silently corrupts the data.

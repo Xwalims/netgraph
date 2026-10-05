@@ -65,6 +65,28 @@ const (
 	icmpHeaderLength = 8
 )
 
+// MaxProbes is the most probes one hop may be sent. It is a limit of the port
+// arithmetic rather than of patience: a probe's destination port is the only
+// part of it that survives into the ICMP quote, so two probes sharing a port
+// cannot be told apart. See probePort.
+const MaxProbes = 20
+
+// probePort returns the destination port for one probe at one TTL.
+//
+// The stride between consecutive TTLs is MaxProbes, not 8. A stride of 8 with
+// `firstProbePort + ttl*8 + probe` was correct only while probes per hop was
+// 3 -- and it stayed wrong silently for every value the CLI accepts above 8:
+// TTL 2's first probe took port 33450, which TTL 1's ninth probe had already
+// used, so t.recordSend overwrote the earlier entry and a reply to it was
+// attributed to the wrong hop. `--probes 12` collided 20 times over six TTLs,
+// and the loss arithmetic then produced a negative fraction because Received
+// ended up larger than Sent. The stride has to clear the largest probe count
+// the flag permits, which is why it is written in terms of MaxProbes rather
+// than repeated as a literal.
+func probePort(ttl, probe int) int {
+	return firstProbePort + ttl*MaxProbes + probe
+}
+
 // Options configures a trace.
 type Options struct {
 	// Protocol is icmp, udp or tcp. All three need a raw socket here, because all
@@ -168,6 +190,12 @@ type probeResult struct {
 	// Reached is true when the destination itself answered, meaning its own stack
 	// received the packet rather than a router reporting on its behalf.
 	Reached bool
+
+	// Port is the destination port of the probe this reply answers, which
+	// identifies the probe. collect uses it to count a probe once no matter how
+	// many replies arrive for it. It is 0 for an echo reply or an ICMPv6 error
+	// that carries no port, which is exactly one reply per hop anyway.
+	Port int
 }
 
 // tracer holds the state of one run.
@@ -340,7 +368,7 @@ func (t *tracer) probeAll(ctx context.Context, replies <-chan probeResult) ([]mo
 		for probe := 0; probe < t.options.Probes; probe++ {
 			// A distinct port per probe is what makes the reply attributable, and
 			// it keeps the sequence recognisable on the destination.
-			port := firstProbePort + ttl*8 + probe
+			port := probePort(ttl, probe)
 			if port > 65535 {
 				continue
 			}
@@ -357,6 +385,13 @@ func (t *tracer) probeAll(ctx context.Context, replies <-chan probeResult) ([]mo
 		windowCtx, windowCancel := context.WithTimeout(ctx, window)
 		t.collect(windowCtx, replies, results)
 		windowCancel()
+
+		// The window is closed, so these probes can no longer be answered and
+		// their ports must not stay claimable: leaving them in t.sent lets a late
+		// reply be attributed to this hop during a LATER window, and lets a
+		// re-sent probe at the same TTL overwrite the record and shift its RTT to
+		// the newer send time. forget() existed and was called only from a test.
+		t.forget(ports)
 
 		if destinationAnswered(results, ttl) {
 			break
@@ -395,12 +430,29 @@ func (t *tracer) forget(ports []int) {
 }
 
 // collect drains replies into the results table for one TTL window.
+//
+// Replies arrive slightly after the send window closes -- the fastest ones,
+// which are the ones that matter for the minimum, are the first to arrive and
+// the easiest to drop. So collection outlives the window by a moment.
 func (t *tracer) collect(ctx context.Context, replies <-chan probeResult, results map[int][]probeResult) {
-	// Replies arrive slightly after the send window closes -- the fastest ones,
-	// which are the ones that matter for the minimum, are the first to arrive and
-	// the easiest to drop. So collection outlives the window by a moment.
 	grace := time.After(300 * time.Millisecond)
+
+	// One probe, one reply. A router that answers twice, or a probe whose first
+	// reply is duplicated on the path, otherwise lands in the table twice and
+	// Received climbs past Sent -- which is not merely ugly: buildHops computes
+	// loss as (Sent-Received)/Sent, so the rendered figure goes negative and a
+	// hop reports -133% loss. The port identifies the probe, so the second
+	// arrival for a port already recorded in this window is discarded.
 	seen := map[int]bool{}
+
+	// record files a reply unless that port already answered in this window.
+	record := func(result probeResult) {
+		if seen[result.Port] {
+			return
+		}
+		seen[result.Port] = true
+		results[result.TTL] = append(results[result.TTL], result)
+	}
 
 	for {
 		select {
@@ -408,8 +460,7 @@ func (t *tracer) collect(ctx context.Context, replies <-chan probeResult, result
 			if !ok {
 				return
 			}
-			seen[result.TTL] = true
-			results[result.TTL] = append(results[result.TTL], result)
+			record(result)
 		case <-grace:
 			return
 		case <-ctx.Done():
@@ -418,8 +469,7 @@ func (t *tracer) collect(ctx context.Context, replies <-chan probeResult, result
 			for {
 				select {
 				case result := <-replies:
-					seen[result.TTL] = true
-					results[result.TTL] = append(results[result.TTL], result)
+					record(result)
 				default:
 					return
 				}
@@ -490,14 +540,26 @@ func buildHops(results map[int][]probeResult, probesPerHop int) []models.Hop {
 		// fraction of probes that came back. TTLs where nothing answered are
 		// absent rather than rendered as a placeholder, because a placeholder is
 		// indistinguishable from a router that chose not to answer.
+		//
+		// Received is clamped to the probes actually sent. Loss is a fraction of
+		// something, so it cannot exceed 1, and a negative percentage is worse
+		// than no measurement: it asserts that more probes came back than were
+		// ever sent. collect() now deduplicates by port, so this is a floor
+		// rather than a live path -- but the clamp belongs here anyway, because
+		// this is the function that decides what the report says.
+		received := len(list)
+		if received > probesPerHop {
+			received = probesPerHop
+		}
+
 		hops = append(hops, models.Hop{
 			Number:    ttl,
 			Address:   address,
 			RTT:       best,
 			RTTSpread: worst - best,
 			Sent:      probesPerHop,
-			Received:  len(list),
-			Loss:      float64(probesPerHop-len(list)) / float64(probesPerHop),
+			Received:  received,
+			Loss:      float64(probesPerHop-received) / float64(probesPerHop),
 		})
 	}
 	return hops
@@ -680,6 +742,7 @@ func (t *tracer) parseReply(packet []byte, peer net.Addr) (probeResult, bool) {
 		TTL:     record.ttl,
 		RTT:     time.Since(record.sentAt),
 		Reached: reached,
+		Port:    port,
 	}
 	if peer != nil {
 		result.Address = addressOnly(peer)
