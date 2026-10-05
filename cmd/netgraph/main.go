@@ -28,22 +28,40 @@ import (
 
 // version is the module's version. It is stated once so the banner, --version
 // and the build metadata cannot drift apart.
-const version = "0.1.0"
+const version = "0.2.0"
 
 const usage = `netgraph %s -- see how the internet reaches your destination
 
 Usage:
+  netgraph trace <target>        trace the route to a target
+  netgraph map <target>          trace, then draw the route
   netgraph dns <domain>          resolve a name and show every record type
-  netgraph ip <address>          classify an address (not yet implemented)
-  netgraph trace <target>        trace the route (not yet implemented)
-  netgraph ping <target>         measure latency (not yet implemented)
-  netgraph asn <address>         look up an autonomous system (not yet implemented)
-  netgraph compare <a> <b>       compare two routes (not yet implemented)
-  netgraph map <target>          visualise the route (not yet implemented)
+  netgraph ip <address>          classify an address
+  netgraph asn <address>         look up an autonomous system
+  netgraph ping <target>         measure latency
+  netgraph compare <a> <b>...    trace several targets and diff the paths
+  netgraph export                re-render a saved result in another format
+  netgraph cache [cmd]           stats, clear or sweep the lookup cache
   netgraph watch <target>        monitor a route (not yet implemented)
-  netgraph export                export the last result (not yet implemented)
   netgraph version               print the version
   netgraph help                  print this message
+
+Options for trace, map and compare:
+  --protocol icmp|udp|tcp      probe method (default udp)
+  --max-hops <n>               highest TTL to try (default 30)
+  --probes <n>                 probes per hop (default 3)
+  --timeout <duration>         overall timeout (default 3s)
+  --ipv6                       trace over IPv6
+  --interface <address>        bind probes to a source address
+  --format ascii|html|json|csv output format for map (default ascii)
+  --out <path>                 write to a file instead of stdout
+
+Options for ip, asn and ping:
+  --count <n>                  probes to send (default 5)
+  --interval <duration>        pause between probes (default 1s)
+  --continuous                 keep sending until interrupted
+  --port <n>                   TCP port to measure against (default 443)
+  --no-cache                   refetch instead of using the cache
 
 Options for dns:
   --server <addr>       query this nameserver instead of the system resolver
@@ -94,24 +112,40 @@ func run(args []string) int {
 	case "version", "--version", "-v":
 		fmt.Printf("netgraph %s\n", version)
 		return exitOK
+	}
+
+	// Ctrl-C and SIGTERM must stop the command promptly rather than after the
+	// last timeout, so the context is created once here and handed down.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// The DNS path keeps its own resolver and flag handling in this file; the
+	// route, address and latency commands live in commands.go, next to the
+	// shared argument parser.
+	tool := newApp()
+
+	switch args[0] {
 	case "dns":
-		return runDNS(args[1:])
+		return runDNS(ctx, args[1:])
+	case "trace":
+		return tool.cmdTrace(ctx, args[1:])
+	case "map":
+		return tool.cmdMap(ctx, args[1:])
+	case "ip":
+		return tool.cmdIP(ctx, args[1:])
+	case "asn":
+		return tool.cmdASN(ctx, args[1:])
+	case "ping":
+		return tool.cmdPing(ctx, args[1:])
+	case "compare":
+		return tool.cmdCompare(ctx, args[1:])
+	case "export":
+		return tool.cmdExport(args[1:])
+	case "cache":
+		return tool.cmdCache(args[1:])
 	}
 
-	// Everything else is announced rather than attempted. A command that prints
-	// nothing and exits 0 is the worst outcome for a caller, because it cannot
-	// be distinguished from success.
-	command := args[0]
-	implemented := map[string]bool{
-		"dns": true,
-	}
-	if !implemented[command] {
-		fmt.Fprintf(os.Stderr, "netgraph %s: %q is not implemented in %s yet.\n", version, command, version)
-		fmt.Fprintf(os.Stderr, "Working commands: dns, version, help\n")
-		return exitUnimplemented
-	}
-
-	fmt.Fprintf(os.Stderr, "netgraph: unknown command %q\n", command)
+	fmt.Fprintf(os.Stderr, "netgraph: unknown command %q\n\n", args[0])
 	fmt.Fprint(os.Stderr, usageFmt())
 	return exitUnimplemented
 }
@@ -193,7 +227,7 @@ func parseDNSFlags(args []string) (dnsFlags, []string, error) {
 	return flags, positional, nil
 }
 
-func runDNS(args []string) int {
+func runDNS(ctx context.Context, args []string) int {
 	flags, positional, err := parseDNSFlags(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "netgraph: %v\n", err)
@@ -209,10 +243,6 @@ func runDNS(args []string) int {
 		return exitUnimplemented
 	}
 	name := positional[0]
-
-	// Ctrl-C must stop the command promptly rather than after the last timeout.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	types, err := requestedTypes(flags)
 	if err != nil {
