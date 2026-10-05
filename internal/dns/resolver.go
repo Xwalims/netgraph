@@ -119,6 +119,11 @@ type Result struct {
 
 	// Response is the human-readable meaning of RCode.
 	Response string
+
+	// Warnings records anything that made this result less complete than asked
+	// for -- a truncated answer whose TCP retry failed, for instance. A tool
+	// that quietly drops the warning is claiming an answer it does not have.
+	Warnings []string
 }
 
 // Record is one answer, normalised away from the wire format.
@@ -186,8 +191,8 @@ func (r *Resolver) Lookup(ctx context.Context, name, recordType string) (*Result
 	// out what each server says.
 	query := buildQuery(name, dnsType[parsed], nextQueryID())
 	var lastErr error
-	for _, server := range r.options.Servers {
-		result, err := r.queryServer(queryCtx, server, query, name, parsed)
+	for i, server := range r.options.Servers {
+		result, err := r.queryServer(queryCtx, server, query, name, parsed, false, i == 0)
 		if err == nil {
 			return result, nil
 		}

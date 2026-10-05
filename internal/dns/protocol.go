@@ -76,12 +76,21 @@ func appendUint32(buf []byte, value uint32) []byte {
 }
 
 // queryServer sends one query to one server and parses the answer.
+//
+// network is passed in as forceTCP rather than always derived from r.options,
+// so the TCP retry for a truncated answer can reuse this function without
+// mutating the Resolver: a shared Resolver must stay race-free.
+//
+// first marks the first server in a multi-server lookup, which is the only one
+// allowed to retry a truncated answer over TCP.
 func (r *Resolver) queryServer(
 	ctx context.Context,
 	server string,
 	query []byte,
 	name string,
 	recordType RecordType,
+	forceTCP bool,
+	first bool,
 ) (*Result, error) {
 	address, err := normaliseServer(server)
 	if err != nil {
@@ -89,7 +98,8 @@ func (r *Resolver) queryServer(
 	}
 
 	start := time.Now()
-	conn, err := dialTimeout(ctx, networkFor(address, r.options.TCP), address, r.options.Timeout)
+	network := networkFor(address, r.options.TCP || forceTCP)
+	conn, err := dialTimeout(ctx, network, address, r.options.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", server, err)
 	}
@@ -101,7 +111,7 @@ func (r *Resolver) queryServer(
 	}
 	_ = conn.SetDeadline(deadline)
 
-	if networkFor(address, r.options.TCP) == "tcp" {
+	if network == "tcp" {
 		// Over TCP the message is length-prefixed. Without the prefix the server
 		// reads the first two bytes as a length and misparses everything after.
 		framed := make([]byte, 2+len(query))
@@ -129,7 +139,7 @@ func (r *Resolver) queryServer(
 	readBuffer := make([]byte, dnsResponseBufferSize)
 	messageLength := 0
 
-	if networkFor(address, r.options.TCP) == "tcp" {
+	if network == "tcp" {
 		var lengthBuf [2]byte
 		if _, err := readFull(conn, lengthBuf[:]); err != nil {
 			return nil, fmt.Errorf("read length from %s: %w", server, err)
@@ -165,6 +175,39 @@ func (r *Resolver) queryServer(
 	// partial answer would be reporting an incomplete result as complete.
 	truncated := header[2]&0x02 != 0
 
+	if truncated && network == "udp" {
+		// Options.TCP promises that "a response larger than a UDP datagram is
+		// switched over automatically". Honouring that means re-asking over
+		// TCP rather than handing back a partial answer with a flag on it: the
+		// caller asked for the records, and TC exists precisely to say they
+		// did not fit.
+		//
+		// Only on the first server. If several servers are being compared, a
+		// server that keeps truncating must not turn one UDP probe into N
+		// sequential TCP probes.
+		if first {
+			tcpResult, err := r.queryOverTCP(ctx, server, query, name, recordType)
+			if err == nil {
+				return tcpResult, nil
+			}
+			// The TCP attempt failed. Falling back to the truncated UDP answer
+			// is strictly more informative than reporting only the TCP error,
+			// so the partial result is kept and the reason recorded.
+			answers, rcode, perr := parseAnswer(message, recordType)
+			if perr != nil {
+				return nil, fmt.Errorf("parse answer from %s: %w", server, perr)
+			}
+			result := &Result{
+				Name: name, Type: recordType, Server: server,
+				Records: answers, RTT: elapsed, Truncated: true,
+				RCode: rcode, Response: rcodeName(rcode),
+			}
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("response was truncated over UDP and the TCP retry failed: %v", err))
+			return result, nil
+		}
+	}
+
 	answers, rcode, err := parseAnswer(message, recordType)
 	if err != nil {
 		return nil, fmt.Errorf("parse answer from %s: %w", server, err)
@@ -180,6 +223,30 @@ func (r *Resolver) queryServer(
 		RCode:     rcode,
 		Response:  rcodeName(rcode),
 	}, nil
+}
+
+// queryOverTCP re-issues a query over TCP, which has no datagram size limit.
+//
+// A truncated UDP answer is the one case where retrying is unambiguously
+// correct: TC is a statement that the answer is incomplete, and TCP exists so
+// the complete answer can be fetched.
+//
+// It does not touch r.options. Flipping a flag on the Resolver to switch
+// transport would race with any concurrent Lookup sharing it.
+func (r *Resolver) queryOverTCP(
+	ctx context.Context,
+	server string,
+	query []byte,
+	name string,
+	recordType RecordType,
+) (*Result, error) {
+	// A TCP query is length-prefixed by queryServer itself, so an already
+	// framed query has to be handed back in its bare form.
+	unframed := query
+	if len(query) >= 2 && int(binary.BigEndian.Uint16(query[0:2])) == len(query)-2 {
+		unframed = query[2:]
+	}
+	return r.queryServer(ctx, server, unframed, name, recordType, true, true)
 }
 
 // normaliseServer turns "1.1.1.1" or "dns.google" into "1.1.1.1:53".
@@ -299,7 +366,10 @@ func parseAnswer(msg []byte, want RecordType) ([]Record, int, error) {
 		if offset+rdLength > len(msg) {
 			break
 		}
-		rdata := msg[offset : offset+rdLength]
+		// rdStart is where the rdata begins in the WHOLE message, which is the
+		// base a compression pointer inside it is resolved against.
+		rdStart := offset
+		rdata := msg[rdStart : rdStart+rdLength]
 		offset += rdLength
 
 		// Only class IN is meaningful here; a CH record would otherwise show up
@@ -308,7 +378,13 @@ func parseAnswer(msg []byte, want RecordType) ([]Record, int, error) {
 			continue
 		}
 
-		record, ok := parseRecord(name, rrType, ttl, rdata)
+		// RDATA is passed with the whole message and its offset inside it, not
+		// on its own: RFC 1035 4.1.4 allows a name in the RDATA of NS, CNAME,
+		// SOA, PTR and MX to be compressed, so those rdata bytes can be a
+		// pointer whose target is elsewhere in the message. Decoding an rdata
+		// slice on its own resolves those pointers against the wrong base
+		// address and the record is dropped -- see parseRecord.
+		record, ok := parseRecord(msg, rdStart, name, rrType, ttl, rdata)
 		if !ok {
 			continue
 		}
@@ -323,8 +399,51 @@ func parseAnswer(msg []byte, want RecordType) ([]Record, int, error) {
 }
 
 // parseRecord converts one resource record into the package's Record type.
-func parseRecord(name string, rrType uint16, ttl uint32, rdata []byte) (Record, bool) {
+//
+// msg is the whole DNS message and rdStart is the offset of rdata inside it,
+// which are needed because a name inside the rdata may be a compression
+// pointer. RFC 1035 4.1.4 permits compression in the RDATA of NS, CNAME, SOA,
+// PTR and MX:
+//
+//	"In the case of a CNAME, NS, PTR, MX, or SOA RR, the domain name may be
+//	 stored as a domain name (or a list of domain names) as usual, but may be
+//	 stored as a pointer...  the compression scheme described in this
+//	 paragraph may be used."
+//
+// Real resolvers do exactly that. A verbatim answer from systemd-resolved for
+// "www.github.com CNAME" carries rdata `c0 10`, a pointer to offset 0x10 of the
+// message, not to an offset within the rdata. Decoding the rdata slice on its
+// own -- readName(rdata, 0) -- therefore reads a pointer to offset 0x10 of a
+// two-byte slice, finds nothing sensible there, and the record is silently
+// dropped. That loses the CNAME of every ordinary name resolution.
+func parseRecord(msg []byte, rdStart int, name string, rrType uint16, ttl uint32, rdata []byte) (Record, bool) {
 	record := Record{Name: name, TTL: ttl}
+
+	// nameAt decodes the domain name that begins rdLen bytes into the rdata,
+	// where rdLen is the fixed header preceding it (0 for CNAME/NS/PTR, 2 for
+	// MX, 6 for SRV). The name is read at its offset in the whole message so
+	// compression pointers resolve correctly; the rdata slice itself only
+	// supplies the length check.
+	nameAt := func(rdLen int) (string, bool) {
+		if len(rdata) < rdLen {
+			return "", false
+		}
+		// next is the offset just past the encoded name, so next-start is how
+		// many bytes of this record the name actually occupied. For a
+		// compressed name that is the two bytes of the pointer, which is what
+		// makes this one check correct for both encodings.
+		start := rdStart + rdLen
+		target, next, err := readName(msg, start)
+		if err != nil {
+			return "", false
+		}
+		if next-start > len(rdata)-rdLen {
+			// The name runs past this record's rdata into the next record's
+			// bytes, so it is not a name this record actually contains.
+			return "", false
+		}
+		return target, true
+	}
 
 	switch RecordType(typeName(rrType)) {
 	case TypeA:
@@ -340,22 +459,22 @@ func parseRecord(name string, rrType uint16, ttl uint32, rdata []byte) (Record, 
 		record.Type = TypeAAAA
 		record.Value = net.IP(rdata[:16]).String()
 	case TypeCNAME:
-		target, _, err := readName(rdata, 0)
-		if err != nil {
+		target, ok := nameAt(0)
+		if !ok {
 			return record, false
 		}
 		record.Type = TypeCNAME
 		record.Value = target
 	case TypeNS:
-		target, _, err := readName(rdata, 0)
-		if err != nil {
+		target, ok := nameAt(0)
+		if !ok {
 			return record, false
 		}
 		record.Type = TypeNS
 		record.Value = target
 	case TypePTR:
-		target, _, err := readName(rdata, 0)
-		if err != nil {
+		target, ok := nameAt(0)
+		if !ok {
 			return record, false
 		}
 		record.Type = TypePTR
@@ -370,8 +489,8 @@ func parseRecord(name string, rrType uint16, ttl uint32, rdata []byte) (Record, 
 		if len(rdata) < 3 {
 			return record, false
 		}
-		target, _, err := readName(rdata, 2)
-		if err != nil {
+		target, ok := nameAt(2)
+		if !ok {
 			return record, false
 		}
 		record.Type = TypeMX
@@ -381,8 +500,8 @@ func parseRecord(name string, rrType uint16, ttl uint32, rdata []byte) (Record, 
 		if len(rdata) < 7 {
 			return record, false
 		}
-		target, _, err := readName(rdata, 6)
-		if err != nil {
+		target, ok := nameAt(6)
+		if !ok {
 			return record, false
 		}
 		record.Type = TypeSRV
@@ -391,16 +510,25 @@ func parseRecord(name string, rrType uint16, ttl uint32, rdata []byte) (Record, 
 		record.Port = binary.BigEndian.Uint16(rdata[4:6])
 		record.Value = target
 	case TypeSOA:
-		mname, next, err := readName(rdata, 0)
+		// SOA rdata is two names (MNAME and RNAME). Both are read at their
+		// offset in the whole message so a compressed name in either position
+		// resolves, and both have to stay inside this record's rdata.
+		first, next, err := readName(msg, rdStart)
 		if err != nil {
 			return record, false
 		}
-		rname, _, err := readName(rdata, next)
+		if next-rdStart > len(rdata) {
+			return record, false
+		}
+		second, end, err := readName(msg, next)
 		if err != nil {
+			return record, false
+		}
+		if end-rdStart > len(rdata) {
 			return record, false
 		}
 		record.Type = TypeSOA
-		record.Value = fmt.Sprintf("%s %s", mname, rname)
+		record.Value = fmt.Sprintf("%s %s", first, second)
 	case TypeCAA:
 		// rdata: flags(1) tagLen(1) tag value
 		if len(rdata) < 2 {
