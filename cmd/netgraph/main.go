@@ -1,15 +1,27 @@
 // Command netgraph inspects a network path.
 //
-// # Scope of this build
+// # Commands
 //
-// The traceroute engine, the TUI, the HTML exporter and the watch command are
-// not implemented yet. Rather than ship commands that print nothing, every
-// unimplemented command reports that plainly and exits non-zero, so a script
-// depending on it fails loudly instead of silently succeeding.
+//	trace     measure the route to a target          needs CAP_NET_RAW
+//	map       trace, then draw it                     needs CAP_NET_RAW
+//	dns       resolve a name                          no privileges
+//	ip        classify an address                     no privileges
+//	asn       look up an autonomous system            no privileges
+//	ping      measure end-to-end latency              no privileges
+//	compare   trace several targets and diff them     needs CAP_NET_RAW
+//	export    re-render a saved result                no privileges
+//	cache     inspect or prune the lookup cache       no privileges
+//	watch     report changes over time                no privileges
 //
-// What does work today is the DNS analyzer, which is a complete implementation:
-// it builds and parses DNS messages itself, supports every record type in the
-// brief, compares servers, and reports RTT and TTL from real responses.
+// The DNS analyzer lives in this file; the route, address, latency and monitoring
+// commands are in commands.go, which also holds the shared argument parser.
+//
+// # Nothing is invented
+//
+// Where this host cannot answer a question -- no raw socket, ICMP filtered, a
+// registry unreachable -- the tool says so and names what to do about it. A route
+// drawn with hops that were never observed is worse than no route, because a
+// screenshot of it gets pasted into an incident report.
 package main
 
 import (
