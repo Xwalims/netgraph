@@ -2,6 +2,7 @@ package dns
 
 import (
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -152,7 +153,8 @@ func TestParseAnswerReadsNSWithCompressedTargets(t *testing.T) {
 }
 
 // SOA rdata holds two names, and in this answer the first is uncompressed while
-// the second is a pointer. Both have to be read at their offset in the message.
+// the second is a pointer. Both have to be read at their offset in the message,
+// and all five 32-bit integers that follow them are part of the record.
 func TestParseAnswerReadsSOAWhoseSecondNameIsCompressed(t *testing.T) {
 	records, _, err := parseAnswer(decode(t, fixtureSOA), TypeSOA)
 	if err != nil {
@@ -161,9 +163,61 @@ func TestParseAnswerReadsSOAWhoseSecondNameIsCompressed(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("got %d SOA records, want 1", len(records))
 	}
-	want := "ns-1707.awsdns-21.co.uk awsdns-hostmaster.amazon.com"
+	// The five numbers are not transcribed by hand. They are the last 20 bytes
+	// of this captured answer's rdata, read out of the fixture itself by
+	// scripts/soa-oracle.py, which decodes the wire format independently of this
+	// package. RFC 1035 3.3.13 fixes both the order and the widths.
+	want := "ns-1707.awsdns-21.co.uk awsdns-hostmaster.amazon.com 1 7200 900 1209600 86400"
 	if records[0].Value != want {
 		t.Errorf("SOA = %q, want %q", records[0].Value, want)
+	}
+}
+
+// The SERIAL is the reason to look at an SOA at all: it says whether the zone has
+// moved since you last looked. Reading the two names and stopping -- which is
+// what this code did -- produced an answer that looks complete and silently
+// omits five fields, so the zone's version was unreportable and two resolvers'
+// SOA records compared equal no matter how far apart they were.
+func TestSOAValueCarriesItsSerialAndTimers(t *testing.T) {
+	records, _, err := parseAnswer(decode(t, fixtureSOA), TypeSOA)
+	if err != nil {
+		t.Fatalf("parseAnswer failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("got %d SOA records, want 1", len(records))
+	}
+	fields := strings.Fields(records[0].Value)
+	if len(fields) != 7 {
+		t.Fatalf("SOA value %q has %d fields, want 7 (mname rname serial refresh retry expire minimum)",
+			records[0].Value, len(fields))
+	}
+	want := []string{"1", "7200", "900", "1209600", "86400"}
+	for i, w := range want {
+		if fields[2+i] != w {
+			t.Errorf("SOA field %d = %q, want %q (full value %q)", 2+i, fields[2+i], w, records[0].Value)
+		}
+	}
+}
+
+// An SOA whose rdata is too short to hold the five integers is malformed.
+// Reporting the two names it does contain would be a partial answer dressed as a
+// whole one, so the record is refused instead.
+func TestSOAWithoutItsFiveIntegersIsRefused(t *testing.T) {
+	rdata := encodeName("ns.example.com")
+	rdata = append(rdata, encodeName("hostmaster.example.com")...)
+	rdata = append(rdata, 0, 0, 0, 1) // SERIAL only: 4 of the required 20 bytes
+
+	msg := headerWithAnswers(1)
+	msg = appendRecord(msg, "example.com", 6, 1, 3600, rdata)
+
+	records, _, err := parseAnswer(msg, TypeSOA)
+	if err != nil {
+		t.Fatalf("parseAnswer failed: %v", err)
+	}
+	for _, r := range records {
+		if r.Type == TypeSOA {
+			t.Errorf("a truncated SOA was reported as a record: %q", r.Value)
+		}
 	}
 }
 

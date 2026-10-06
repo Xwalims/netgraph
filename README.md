@@ -308,6 +308,125 @@ resolver fills in when a truncated UDP answer could not be retried over TCP, was
 never read by the CLI at all, so a partial answer looked complete; it is now
 printed, and carried in `--json`.
 
+### Two bugs found by diffing against dig
+
+`dig` is BIND's own client and shares no code with this package, which makes it
+a usable oracle: 19 names × 9 record types, compared value by value. The unit
+suite was green throughout. Two real defects showed up that way.
+
+**An SOA was missing five of its seven fields.** RFC 1035 §3.3.13 defines SOA
+RDATA as MNAME, RNAME and then five 32-bit integers — SERIAL, REFRESH, RETRY,
+EXPIRE, MINIMUM. The parser read the two names and stopped. The output looked
+like a complete SOA and was not one:
+
+```console
+$ netgraph dns debian.org --server 9.9.9.9 --type SOA     # before
+
+  SOA    1 records  rtt=39ms  rcode=NOERROR
+        denis.debian.org hostmaster.debian.org ttl=458
+```
+
+SERIAL is the reason anyone looks at an SOA: it says whether the zone has moved
+since you last asked. Without it the zone's version was unreportable, and two
+resolvers holding very different copies of a zone compared equal. Now:
+
+```console
+$ netgraph dns debian.org --server 9.9.9.9 --type SOA
+
+  SOA    1 records  rtt=41.1ms  rcode=NOERROR
+        denis.debian.org hostmaster.debian.org 2026100611 1800 600 1814400 600 ttl=262
+```
+
+The five integers are derived, not typed. `scripts/soa-oracle.py` decodes the
+captured wire fixture in `internal/dns/compression_test.go` using only the wire
+format, sharing no code with the package, and `--check` asserts that the Go test
+agrees with it — because `1209600` and `12096000` are indistinguishable in a
+diff and nobody catches the typo.
+
+**A priority or port of zero was printed as though the field were absent.** The
+renderer gated MX priority and the SRV triple on the numbers being non-zero. That
+conflates "this field does not apply to this type" with "this field applies and
+happens to be zero" — and a zero priority is the *best* priority:
+
+```console
+$ netgraph dns youtube.com --server 9.9.9.9 --type MX     # before
+
+  MX     1 records  rtt=67.6ms  rcode=NOERROR
+        smtp.google.com                  ttl=300
+```
+
+youtube.com's only MX is `0 smtp.google.com`. Printed without the zero, the one
+record that says "this is the primary" was indistinguishable from one whose
+priority had merely been left out. The RFC 2782 "no service available here" SRV
+record `0 0 0 .` was hit by the same rule and printed as a bare `.`, which reads
+like a usable target rather than the explicit statement that there is no port.
+The gate is now the record's *type*, so the fields print whenever they apply:
+
+```console
+$ netgraph dns youtube.com --server 9.9.9.9 --type MX
+
+  MX     1 records  rtt=67.6ms  rcode=NOERROR
+        smtp.google.com                  ttl=300  priority=0
+
+$ netgraph dns _sip._udp.sip.voice.google.com --server 9.9.9.9 --type SRV
+
+  SRV    2 records  rtt=156.3ms  rcode=NOERROR
+        sip-anycast-1.voice.google.com   ttl=300  priority=10 weight=1 port=5060
+        sip-anycast-2.voice.google.com   ttl=300  priority=20 weight=1 port=5060
+```
+
+`--json` had the same defect more severely: it published `values` as bare
+strings, so MX priority and the entire SRV triple were dropped and a script
+consuming the JSON could not tell a primary exchanger from a fallback, nor which
+port an SRV named. They are now part of the value, as dig prints them:
+
+```console
+$ netgraph dns _sip._udp.sip.voice.google.com --server 9.9.9.9 --type SRV --json
+{
+  "name": "_sip._udp.sip.voice.google.com",
+  "server": "9.9.9.9",
+  "results": [
+    {
+      "type": "SRV",
+      "rtt": "38.1ms",
+      "rcode": 0,
+      "response": "NOERROR",
+      "truncated": false,
+      "values": [
+        "10 1 5060 sip-anycast-1.voice.google.com",
+        "20 1 5060 sip-anycast-2.voice.google.com"
+      ],
+      "ttl": [
+        297,
+        297
+      ]
+    }
+  ]
+}
+```
+
+A and AAAA records gain nothing, so the common case is byte-for-byte unchanged.
+
+#### Where the differential disagrees with dig on purpose
+
+Two differences are `dig` being wrong, not this tool. Both were checked against
+the wire by an independent client, because "our output looks better" is not
+evidence.
+
+**dig separates a chunked TXT record with a space.** github.com's SPF record does
+not fit one 255-byte character-string and arrives as two. RFC 1035 §3.3.14 makes
+a TXT record's content their *concatenation*, so the address is
+`ip4:62.253.227.114`. `dig` displays the chunks space-separated, which renders it
+`ip4:62.253.2 27.114` — a different, invalid address, in the tool of record.
+Concatenating is correct.
+
+**Some zones genuinely flap.** github.com's authoritative servers return
+different A records and different SOAs on adjacent queries — five consecutive
+`dig` queries with nothing else changed returned two different SOA answers. A
+single-query differential therefore reports noise for those names, and the
+harness above marks them unstable rather than silently counting them as either a
+pass or a bug. `netgraph dns --compare` exists for exactly this question.
+
 ---
 
 ### `netgraph ip 1.1.1.1`

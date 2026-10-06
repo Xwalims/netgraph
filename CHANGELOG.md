@@ -8,6 +8,27 @@ All notable changes to netgraph are recorded here. The format follows
 
 ### Fixed
 
+- An SOA record was missing five of its seven fields. RFC 1035 3.3.13 defines SOA
+  RDATA as MNAME, RNAME and then five 32-bit integers — SERIAL, REFRESH, RETRY,
+  EXPIRE, MINIMUM — and the parser read the two names and stopped. `netgraph dns
+  debian.org --type SOA` printed `denis.debian.org hostmaster.debian.org ttl=458`,
+  which looks like a complete answer and omits the serial: the field that says
+  whether the zone has changed since you last looked, and the only thing two
+  resolvers' copies of a zone can be compared on. The five integers are now
+  decoded, an SOA too short to hold them is refused rather than reported as a
+  partial one, and `scripts/soa-oracle.py` derives the expected values from the
+  wire fixture independently of this package.
+- An MX priority or SRV port/weight of zero was printed as though the field did
+  not apply, because the renderer tested the numbers rather than the record type.
+  A zero priority is the best priority: youtube.com's only MX is
+  `0 smtp.google.com`, and it came out with no priority at all. The RFC 2782
+  "no service here" SRV record `0 0 0 .` printed as a bare `.`, which reads like
+  a usable target rather than the statement that there is no port. These fields
+  now print whenever the type has them.
+- `--json` dropped MX priority and the whole SRV triple, publishing them as bare
+  strings. A script consuming the output could not tell a primary mail exchanger
+  from a last-resort one, nor which port an SRV named. The numbers are now part
+  of the value. A and AAAA output is unchanged.
 - `netgraph dns` no longer asks about a different name than the one you typed. A
   label longer than 63 bytes was silently shortened to 63, so a lookup for a
   70-byte label went out on the wire for a 63-byte one and came back as an

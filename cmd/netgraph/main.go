@@ -419,11 +419,20 @@ func printRecords(result *dns.Result, flags dnsFlags) int {
 		if record.TTLKnown {
 			line += fmt.Sprintf(" ttl=%d", record.TTL)
 		}
-		if record.Priority != 0 {
+		// Gated on the record TYPE, not on the number being non-zero. A zero
+		// priority is the best priority there is -- youtube.com's only MX is
+		// "0 smtp.google.com" -- and a zero port is a real statement too: the
+		// RFC 2782 "no service here" record is "0 0 0 .", and this tool printed
+		// it as a bare "." that reads like a usable target. Testing the value
+		// conflates "this field does not apply to this type" with "this field
+		// applies and happens to be zero", and dropped exactly the records whose
+		// numbers matter most.
+		switch record.Type {
+		case dns.TypeMX:
 			line += fmt.Sprintf("  priority=%d", record.Priority)
-		}
-		if record.Port != 0 {
-			line += fmt.Sprintf("  weight=%d port=%d", record.Weight, record.Port)
+		case dns.TypeSRV:
+			line += fmt.Sprintf("  priority=%d weight=%d port=%d",
+				record.Priority, record.Weight, record.Port)
 		}
 		// The value column is padded for alignment, so a record with no TTL
 		// and no priority ends in whitespace. Trailing blanks make a diff of
@@ -599,6 +608,33 @@ type dnsJSONRecord struct {
 	Warnings  []string `json:"warnings,omitempty"`
 }
 
+// dnsJSONValue renders one record for the --json output.
+//
+// An MX target on its own is ambiguous: "aspmx.l.google.com" says nothing about
+// whether it is the primary or the last-resort server, and the priority is the
+// entire ordering. The same goes for an SRV, where dropping priority, weight and
+// port leaves a hostname that cannot be connected to -- an SRV's whole purpose is
+// to say WHICH port. So the numbers are part of the value, prefixing it the way
+// dig prints them, rather than being dropped because the output shape is a flat
+// list of strings.
+//
+// A and AAAA records have no such fields and are emitted bare, so the common case
+// is unchanged.
+func dnsJSONValue(record dns.Record) string {
+	switch record.Type {
+	case dns.TypeMX:
+		return fmt.Sprintf("%d %s", record.Priority, record.Value)
+	case dns.TypeSRV:
+		return fmt.Sprintf("%d %d %d %s",
+			record.Priority, record.Weight, record.Port, record.Value)
+	case dns.TypeSOA, dns.TypeNS, dns.TypeCNAME, dns.TypePTR,
+		dns.TypeTXT, dns.TypeCAA:
+		return record.Value
+	default:
+		return record.Value
+	}
+}
+
 func runDNSJSON(ctx context.Context, resolver *dns.Resolver, name string, types []string, flags dnsFlags) int {
 	output := dnsJSONResult{Name: name, Server: serverLabel(flags.server, flags.reverse)}
 	total := 0
@@ -619,7 +655,7 @@ func runDNSJSON(ctx context.Context, resolver *dns.Resolver, name string, types 
 		entry.Truncated = result.Truncated
 		entry.Warnings = result.Warnings
 		for _, record := range result.Records {
-			entry.Values = append(entry.Values, record.Value)
+			entry.Values = append(entry.Values, dnsJSONValue(record))
 			if record.TTLKnown {
 				entry.TTL = append(entry.TTL, record.TTL)
 			}

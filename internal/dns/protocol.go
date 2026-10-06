@@ -595,9 +595,20 @@ func parseRecord(msg []byte, rdStart int, name string, rrType uint16, ttl uint32
 		record.Port = binary.BigEndian.Uint16(rdata[4:6])
 		record.Value = target
 	case TypeSOA:
-		// SOA rdata is two names (MNAME and RNAME). Both are read at their
-		// offset in the whole message so a compressed name in either position
-		// resolves, and both have to stay inside this record's rdata.
+		// SOA rdata is two names (MNAME and RNAME) followed by five 32-bit
+		// unsigned integers: SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM
+		// (RFC 1035 3.3.13). Both names are read at their offset in the whole
+		// message so a compressed name in either position resolves, and all
+		// seven fields have to stay inside this record's rdata.
+		//
+		// The five numbers used to be discarded: the value was built as
+		// "mname rname" and stopped there. SERIAL is the whole point of an SOA
+		// record -- it is what tells you whether the zone has been updated
+		// since you last looked, and what two resolvers' copies of a zone can be
+		// compared on -- and printing an SOA without it produced output that
+		// looks like a complete answer and is not one. A tool that shows
+		// "ns-1.example hostmaster.example" for an SOA is reporting less than
+		// it read off the wire, silently.
 		first, next, err := readName(msg, rdStart)
 		if err != nil {
 			return record, false
@@ -612,8 +623,22 @@ func parseRecord(msg []byte, rdStart int, name string, rrType uint16, ttl uint32
 		if end-rdStart > len(rdata) {
 			return record, false
 		}
+		// The five integers are fixed-width, so the rdata must have room for
+		// all of them after the two names. A shorter record is malformed and
+		// reporting the two names it does have would be a partial answer
+		// presented as a whole one.
+		if len(rdata)-(end-rdStart) < 20 {
+			return record, false
+		}
+		numeric := rdata[end-rdStart:]
+		serial := binary.BigEndian.Uint32(numeric[0:4])
+		refresh := binary.BigEndian.Uint32(numeric[4:8])
+		retry := binary.BigEndian.Uint32(numeric[8:12])
+		expire := binary.BigEndian.Uint32(numeric[12:16])
+		minimum := binary.BigEndian.Uint32(numeric[16:20])
 		record.Type = TypeSOA
-		record.Value = fmt.Sprintf("%s %s", first, second)
+		record.Value = fmt.Sprintf("%s %s %d %d %d %d %d",
+			first, second, serial, refresh, retry, expire, minimum)
 	case TypeCAA:
 		// rdata: flags(1) tagLen(1) tag value
 		if len(rdata) < 2 {
