@@ -217,7 +217,10 @@ func (r *Resolver) Lookup(ctx context.Context, name, recordType string) (*Result
 func (r *Resolver) lookupServers(
 	ctx context.Context, name string, parsed RecordType, servers []string,
 ) (*Result, error) {
-	query := buildQuery(name, dnsType[parsed], nextQueryID())
+	query, err := buildQuery(name, dnsType[parsed], nextQueryID())
+	if err != nil {
+		return nil, err
+	}
 	var lastErr error
 	for i, server := range servers {
 		result, err := r.queryServer(ctx, server, query, name, parsed, false, i == 0)

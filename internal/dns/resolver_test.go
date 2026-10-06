@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,7 +46,10 @@ func TestRcodeNameCoversTheCodesThatMatter(t *testing.T) {
 }
 
 func TestBuildQueryHasAValidHeader(t *testing.T) {
-	query := buildQuery("example.com", 1, 0x1234)
+	query, err := buildQuery("example.com", 1, 0x1234)
+	if err != nil {
+		t.Fatalf("buildQuery: %v", err)
+	}
 	if len(query) < 12 {
 		t.Fatalf("query is %d bytes, shorter than a header", len(query))
 	}
@@ -81,17 +85,63 @@ func TestQueryIDsVary(t *testing.T) {
 	}
 }
 
-func TestAppendNameRejectsLabelsOver63Bytes(t *testing.T) {
-	long := ""
-	for i := 0; i < 70; i++ {
-		long += "a"
+func TestBuildQueryRefusesUnencodableName(t *testing.T) {
+	// A label over 63 bytes must be REFUSED, not shortened. Clamping it would
+	// put a different name on the wire, and the resolver would answer for that
+	// other name -- returning an empty result that reads like "no such record"
+	// rather than "your input was invalid".
+	overlong := strings.Repeat("a", 64) + ".example.com"
+
+	if _, err := buildQuery(overlong, 1, 0x1234); err == nil {
+		t.Fatal("a 64-byte label was accepted, so the query would go out for a different name")
+	} else if !strings.Contains(err.Error(), "label 1") {
+		t.Errorf("error does not identify which label is at fault: %v", err)
 	}
-	buf := appendName(nil, long)
-	// The label must be clamped to the protocol limit rather than emitting an
-	// over-long label, which servers reject and which would query a different
-	// name than the user typed.
-	if buf[0] > 63 {
-		t.Errorf("label length byte is %d, must not exceed 63", buf[0])
+
+	// Exactly 63 is the largest legal label and must still be accepted.
+	if _, err := buildQuery(strings.Repeat("a", 63)+".example.com", 1, 0x1234); err != nil {
+		t.Errorf("a legal 63-byte label was rejected: %v", err)
+	}
+}
+
+func TestBuildQueryRefusesOverlongWholeName(t *testing.T) {
+	// Every label is individually legal, but four 63-byte labels already exceed
+	// the 255-octet cap on the encoded name: 4*(1+63) + 1 = 257.
+	four := strings.Join([]string{
+		strings.Repeat("a", 63), strings.Repeat("b", 63),
+		strings.Repeat("c", 63), strings.Repeat("d", 63),
+	}, ".")
+
+	if _, err := buildQuery(four, 1, 0x1234); err == nil {
+		t.Fatal("a 257-octet name was accepted; no resolver can parse it")
+	} else if !strings.Contains(err.Error(), "255") {
+		t.Errorf("error does not state the encoded length or the cap: %v", err)
+	}
+
+	// Three 63-byte labels plus a short TLD is 3*64 + 1 + 4 = 197 octets: legal.
+	ok := strings.Join([]string{
+		strings.Repeat("a", 63), strings.Repeat("b", 63),
+		strings.Repeat("c", 63), "com",
+	}, ".")
+	if _, err := buildQuery(ok, 1, 0x1234); err != nil {
+		t.Errorf("a legal 197-octet name was rejected: %v", err)
+	}
+}
+
+func TestBuildQueryCarriesTheNameItWasGiven(t *testing.T) {
+	// The reason the previous clamp existed at all: the encoded message must
+	// decode back to the exact name, or the query is about something else.
+	name := strings.Repeat("a", 63) + ".example.com"
+	q, err := buildQuery(name, 1, 0x1234)
+	if err != nil {
+		t.Fatalf("buildQuery: %v", err)
+	}
+	decoded, _, err := readName(q, 12)
+	if err != nil {
+		t.Fatalf("readName: %v", err)
+	}
+	if decoded != name {
+		t.Errorf("wire carries %q, want %q", decoded, name)
 	}
 }
 

@@ -4,6 +4,20 @@ All notable changes to netgraph are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `netgraph dns` no longer asks about a different name than the one you typed. A
+  label longer than 63 bytes was silently shortened to 63, so a lookup for a
+  70-byte label went out on the wire for a 63-byte one and came back as an
+  empty answer that reads like "no such record". A name that cannot be encoded
+  is now refused, naming the offending label and the limit.
+- The same check is applied to the whole encoded name. RFC 1035 caps a name at
+  255 octets, which four 63-byte labels already exceed (257), so a name made
+  only of individually legal labels could previously be put on the wire in a
+  form no resolver can parse. It is now refused with the encoded length stated.
+
 ## [0.2.0]
 
 The route release. Every command in the brief now exists.

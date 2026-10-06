@@ -21,6 +21,13 @@ const (
 	// dnsMaxResponseSize caps an announced length over TCP so a broken or
 	// malicious server cannot make the process allocate an arbitrary buffer.
 	dnsMaxResponseSize = 65535
+
+	// maxLabelLength is the RFC 1035 limit on a single label's octets.
+	maxLabelLength = 63
+
+	// maxNameLength is the RFC 1035 limit on a whole encoded name: every label's
+	// bytes plus one length octet each, plus the root terminator.
+	maxNameLength = 255
 )
 
 // queryID hands out the transaction IDs. It starts from a random value because a
@@ -34,7 +41,18 @@ func nextQueryID() uint16 {
 }
 
 // buildQuery encodes a standard recursive query for one name and type.
-func buildQuery(name string, qtype uint16, id uint16) []byte {
+//
+// A name that cannot be encoded is refused rather than altered. The tempting
+// alternative -- clamping an over-long label to 63 octets and sending it --
+// asks the resolver about a DIFFERENT name than the user typed, and the answer
+// comes back as a confident NXDOMAIN or an unrelated record, so nothing about
+// the substitution is visible from the outside. "Looks like no records" is the
+// worst possible failure for a diagnostic tool, and a name over the protocol
+// limit is user error that deserves to be named as such.
+func buildQuery(name string, qtype uint16, id uint16) ([]byte, error) {
+	if err := validateName(name); err != nil {
+		return nil, err
+	}
 	// Header: ID, flags (RD set), QDCOUNT=1, everything else zero.
 	buf := make([]byte, 12, 12+len(name)+6)
 	binary.BigEndian.PutUint16(buf[0:2], id)
@@ -46,20 +64,53 @@ func buildQuery(name string, qtype uint16, id uint16) []byte {
 	buf = appendUint16(buf, qtype)
 	buf = appendUint16(buf, 1) // class IN
 
-	return buf
+	return buf, nil
+}
+
+// validateName rejects a name that cannot be put on the wire as asked.
+//
+// RFC 1035 2.3.4 caps a label at 63 octets and a whole name at 255 octets of
+// encoded form (each label plus its length octet, plus the root terminator).
+func validateName(name string) error {
+	encoded := 1 // root terminator
+	labelNumber := 0
+	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+		if label == "" {
+			continue
+		}
+		labelNumber++
+		if len(label) > maxLabelLength {
+			return fmt.Errorf(
+				"label %d is %d bytes, but a DNS label may not exceed %d",
+				labelNumber, len(label), maxLabelLength)
+		}
+		encoded += 1 + len(label)
+		if encoded > maxNameLength {
+			return fmt.Errorf(
+				"name is %d bytes on the wire, but a DNS name may not exceed %d",
+				encoded, maxNameLength)
+		}
+	}
+	return nil
 }
 
 // appendName encodes a domain name in wire format.
+//
+// The name is assumed already validated by validateName. The bounds below are
+// assertions, not repairs: silently shortening a label here would encode a name
+// the caller never asked for, and the resolver would answer for that other name
+// with no way for the user to notice.
 func appendName(buf []byte, name string) []byte {
 	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
 		if label == "" {
 			continue
 		}
-		// A label longer than 63 bytes cannot be encoded; the protocol's limit is
-		// a hard 63, and silently truncating would produce a query for a
-		// different name than the user asked about.
-		if len(label) > 63 {
-			label = label[:63]
+		if len(label) > maxLabelLength {
+			// Unreachable while the only caller is buildQuery, which validates
+			// first. If it ever fires the caller skipped validateName and the
+			// name must not go out altered, so stop rather than guess.
+			panic(fmt.Sprintf("appendName: label of %d bytes exceeds %d without validateName",
+				len(label), maxLabelLength))
 		}
 		buf = append(buf, byte(len(label)))
 		buf = append(buf, label...)
