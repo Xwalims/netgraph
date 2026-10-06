@@ -52,6 +52,12 @@ The route release. Every command in the brief now exists.
   `Received`, so a hop built by another path reported 0% while dropping probes.
 - The ASN decoder typed RDAP's `vcardArray` as a string. It is a JSON array, so
   every response failed to parse and that source was discarded wholesale.
+- A DNS answer over TCP larger than 4096 bytes crashed the process. The read
+  buffer was sized once for a UDP datagram and the TCP branch sliced it with the
+  length the server announced, having rejected only lengths above 65535 -- so any
+  answer between 4097 and 65535 bytes, which is exactly what TCP exists to
+  carry, panicked with `slice bounds out of range`. Each transport now allocates
+  for its own message, and both converge on one parse path.
 
 ### Known limitations
 

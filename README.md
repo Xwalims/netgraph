@@ -218,6 +218,14 @@ the message. That silently dropped the CNAME chain from every ordinary lookup:
 `www.github.com` returned `records=0` before the fix and `CNAME github.com
 (ttl=3600)` after.
 
+**A TCP answer could be larger than the buffer.** The read buffer was allocated
+once, at the EDNS0/UDP size of 4096 bytes, and the TCP branch then sliced it
+with the length the server announced while rejecting only lengths above 65535.
+Every answer between 4097 and 65535 bytes — precisely the range TCP exists to
+carry — therefore panicked the process instead of being parsed. Each transport
+now allocates a buffer for its own message, and both converge on a single parse
+path in `finishAnswer`.
+
 An earlier attempt also had a "strip the length prefix if it looks like one"
 heuristic, which was removed: it could only ever fire on a message that had no
 prefix, and it corrupts roughly one query in 65536, because the first two bytes

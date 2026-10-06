@@ -136,7 +136,15 @@ func (r *Resolver) queryServer(
 	//
 	// TCP genuinely is stream-oriented, so there the length prefix is read first
 	// and exactly that many bytes follow.
-	readBuffer := make([]byte, dnsResponseBufferSize)
+	//
+	// The two paths allocate DIFFERENTLY and that difference used to be a
+	// process-killing panic: the buffer was sized for a UDP datagram (4096) and
+	// the TCP branch then sliced readBuffer[:messageLength] with a length the
+	// server chose, having only rejected anything above dnsMaxResponseSize
+	// (65535). Any answer between 4097 and 65535 bytes -- which is exactly what
+	// TCP exists to carry -- ran off the end of the slice and took the whole
+	// program down with "slice bounds out of range". The 4096 limit is the EDNS0
+	// buffer for UDP and has nothing to do with a stream that can carry 65535.
 	messageLength := 0
 
 	if network == "tcp" {
@@ -150,32 +158,32 @@ func (r *Resolver) queryServer(
 				"server %s announced an implausible response length of %d bytes",
 				server, messageLength)
 		}
-		n, err := readFull(conn, readBuffer[:messageLength])
+		// Sized to the announced length, which dnsMaxResponseSize has already
+		// bounded, so this cannot allocate an arbitrary amount.
+		readBuffer := make([]byte, messageLength)
+		n, err := readFull(conn, readBuffer)
 		if err != nil {
 			return nil, fmt.Errorf("read answer from %s: %w", server, err)
 		}
 		messageLength = n
-	} else {
-		n, err := conn.Read(readBuffer)
-		if err != nil {
-			return nil, fmt.Errorf("read answer from %s: %w", server, err)
-		}
-		messageLength = n
+		return r.finishAnswer(server, name, recordType, readBuffer[:messageLength], start)
 	}
 
-	if messageLength < 12 {
+	// UDP: one datagram, one read, and it cannot exceed the buffer the kernel
+	// hands over, so a single datagram-sized buffer is the whole story.
+	readBuffer := make([]byte, dnsResponseBufferSize)
+	n, err := conn.Read(readBuffer)
+	if err != nil {
+		return nil, fmt.Errorf("read answer from %s: %w", server, err)
+	}
+	if n < 12 {
 		return nil, fmt.Errorf(
-			"server %s returned %d bytes, shorter than a DNS header", server, messageLength)
+			"server %s returned %d bytes, shorter than a DNS header", server, n)
 	}
-	message := readBuffer[:messageLength]
-	header := message[:12]
-	elapsed := time.Since(start)
+	message := readBuffer[:n]
+	truncated := message[2]&0x02 != 0
 
-	// The TC bit means the answer did not fit in a datagram. Silently returning a
-	// partial answer would be reporting an incomplete result as complete.
-	truncated := header[2]&0x02 != 0
-
-	if truncated && network == "udp" {
+	if truncated {
 		// Options.TCP promises that "a response larger than a UDP datagram is
 		// switched over automatically". Honouring that means re-asking over
 		// TCP rather than handing back a partial answer with a flag on it: the
@@ -199,7 +207,7 @@ func (r *Resolver) queryServer(
 			}
 			result := &Result{
 				Name: name, Type: recordType, Server: server,
-				Records: answers, RTT: elapsed, Truncated: true,
+				Records: answers, RTT: time.Since(start), Truncated: true,
 				RCode: rcode, Response: rcodeName(rcode),
 			}
 			result.Warnings = append(result.Warnings,
@@ -207,6 +215,24 @@ func (r *Resolver) queryServer(
 			return result, nil
 		}
 	}
+
+	return r.finishAnswer(server, name, recordType, message, start)
+}
+
+// finishAnswer parses a complete response message and wraps it in a Result.
+//
+// Both transports converge here so the parse, the truncation flag and the
+// elapsed time are computed the same way whichever way the bytes arrived.
+func (r *Resolver) finishAnswer(
+	server, name string, recordType RecordType, message []byte, start time.Time,
+) (*Result, error) {
+	if len(message) < 12 {
+		return nil, fmt.Errorf(
+			"server %s returned %d bytes, shorter than a DNS header", server, len(message))
+	}
+	// The TC bit means the answer did not fit in a datagram. Silently returning a
+	// partial answer would be reporting an incomplete result as complete.
+	truncated := message[2]&0x02 != 0
 
 	answers, rcode, err := parseAnswer(message, recordType)
 	if err != nil {
@@ -218,7 +244,7 @@ func (r *Resolver) queryServer(
 		Type:      recordType,
 		Server:    server,
 		Records:   answers,
-		RTT:       elapsed,
+		RTT:       time.Since(start),
 		Truncated: truncated,
 		RCode:     rcode,
 		Response:  rcodeName(rcode),
