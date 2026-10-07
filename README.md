@@ -603,7 +603,7 @@ ok  	github.com/Xwalims/netgraph/internal/traceroute
 ok  	github.com/Xwalims/netgraph/internal/watch
 ```
 
-**120 tests.** They build synthetic packets rather than depending on a public
+**137 tests.** They build synthetic packets rather than depending on a public
 resolver being up, because a suite that fails because 1.1.1.1 is slow is a suite
 that proves nothing about the decoder.
 
